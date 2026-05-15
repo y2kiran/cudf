@@ -101,6 +101,7 @@ __device__ void decode_dict_indices_as_int32(
 
     int const dst_pos = [&]() {
       if constexpr (copy_mode_t == copy_mode::DIRECT) {
+        //Means it's densely packed, so we can just subtract the first_row
         return thread_pos - s->first_row;
       } else {
         int dst_pos = sb->nz_idx[rolling_index<state_buf::nz_buf_size>(thread_pos)];
@@ -111,6 +112,7 @@ __device__ void decode_dict_indices_as_int32(
 
     if (thread_pos < target_pos && dst_pos >= 0) {
       int const src_pos = [&]() {
+        //Need to skip the leaf values for lists
         if constexpr (has_lists_t) { return thread_pos + skipped_leaf_values; }
         return thread_pos;
       }();

@@ -304,7 +304,7 @@ class parquet_reader_options {
    * @brief Returns whether the reader should try to output DICTIONARY32 columns.
    *
    * When true, the reader may output DICTIONARY32 columns for fully dict-encoded
-   * string columns instead of fully decoded STRING columns. A DICTIONARY32 column
+   * string columns instead of (decoded) STRING columns. A DICTIONARY32 column
    * consists of an INT32 indices child and a STRING keys child.
    * Best-effort: falls back to STRING if the column has mixed encoding.
    *
