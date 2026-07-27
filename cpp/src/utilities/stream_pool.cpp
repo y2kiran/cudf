@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -13,6 +12,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -36,9 +36,10 @@ std::size_t constexpr DEFAULT_STREAM_POOL_SIZE = 32;
 std::size_t stream_pool_size()
 {
   static std::size_t const size = [] {
-    auto const value =
-      cudf::detail::getenv_or("LIBCUDF_STREAM_POOL_SIZE", DEFAULT_STREAM_POOL_SIZE);
-    return value > 0 ? value : DEFAULT_STREAM_POOL_SIZE;
+    auto const* const env = std::getenv("LIBCUDF_STREAM_POOL_SIZE");
+    if (env == nullptr) { return DEFAULT_STREAM_POOL_SIZE; }
+    auto const value = std::strtoull(env, nullptr, 10);
+    return value > 0 ? static_cast<std::size_t>(value) : DEFAULT_STREAM_POOL_SIZE;
   }();
   return size;
 }

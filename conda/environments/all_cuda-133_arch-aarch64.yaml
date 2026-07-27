@@ -120,4 +120,4 @@ dependencies:
 - zstandard
 - pip:
   - nvidia-sphinx-theme
-name: all_cuda-133_arch-aarch64
+name: cudf_dev
