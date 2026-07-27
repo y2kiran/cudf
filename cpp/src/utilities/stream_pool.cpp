@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -17,13 +18,30 @@
 
 namespace cudf::detail {
 
-// TODO: what is a good number here. what's the penalty for making it larger?
+// Default stream pool size. what's the penalty for making it larger?
 // Dave Baranec rule of thumb was max_streams_needed * num_concurrent_threads,
 // where num_concurrent_threads was estimated to be 4. so using 32 will allow
 // for 8 streams per thread, which should be plenty (decoding will be up to 4
 // kernels when delta_byte_array decoding is added). rmm::cuda_stream_pool
 // defaults to 16.
-std::size_t constexpr STREAM_POOL_SIZE = 32;
+std::size_t constexpr DEFAULT_STREAM_POOL_SIZE = 32;
+
+/**
+ * @brief Size of the global stream pool.
+ *
+ * Configurable via the `LIBCUDF_STREAM_POOL_SIZE` environment variable; defaults to
+ * `DEFAULT_STREAM_POOL_SIZE`. The value is read once on first use. A value of 0 (or an
+ * unparseable value) falls back to the default.
+ */
+std::size_t stream_pool_size()
+{
+  static std::size_t const size = [] {
+    auto const value =
+      cudf::detail::getenv_or("LIBCUDF_STREAM_POOL_SIZE", DEFAULT_STREAM_POOL_SIZE);
+    return value > 0 ? value : DEFAULT_STREAM_POOL_SIZE;
+  }();
+  return size;
+}
 
 // FIXME: "borrowed" from rmm...remove when this stream pool is moved there
 #ifdef NDEBUG
@@ -108,7 +126,7 @@ class rmm_cuda_stream_pool : public cuda_stream_pool {
   rmm::cuda_stream_pool _pool;
 
  public:
-  rmm_cuda_stream_pool() : _pool{STREAM_POOL_SIZE, rmm::cuda_stream::flags::non_blocking} {}
+  rmm_cuda_stream_pool() : _pool{stream_pool_size(), rmm::cuda_stream::flags::non_blocking} {}
   rmm::cuda_stream_view get_stream() override { return _pool.get_stream(); }
   rmm::cuda_stream_view get_stream(stream_id_type stream_id) override
   {
@@ -124,7 +142,7 @@ class rmm_cuda_stream_pool : public cuda_stream_pool {
     return streams;
   }
 
-  [[nodiscard]] std::size_t get_stream_pool_size() const override { return STREAM_POOL_SIZE; }
+  [[nodiscard]] std::size_t get_stream_pool_size() const override { return stream_pool_size(); }
 };
 
 /**
