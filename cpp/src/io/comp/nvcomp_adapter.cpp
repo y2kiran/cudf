@@ -7,6 +7,7 @@
 
 #include "nvcomp_adapter.cuh"
 
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/config_utils.hpp>
 #include <cudf/logger.hpp>
@@ -19,7 +20,10 @@
 #include <nvcomp/snappy.h>
 #include <nvcomp/zstd.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 
 namespace cudf::io::detail::nvcomp {
 namespace {
@@ -546,28 +550,50 @@ void batched_decompress(compression_type compression,
   rmm::device_uvector<size_t> actual_uncompressed_data_sizes(num_chunks, stream);
   rmm::device_uvector<nvcompStatus_t> nvcomp_statuses(num_chunks, stream);
 
-  // Temporary space required for decompression
-  auto const temp_size = batched_decompress_temp_size_ex(compression,
-                                                         nvcomp_args.input_data_ptrs,
-                                                         nvcomp_args.input_data_sizes,
-                                                         max_uncomp_chunk_size,
-                                                         max_total_uncomp_size,
-                                                         stream);
-  rmm::device_buffer scratch(temp_size, stream);
+  // The hardware decompression engine (DE) exhibits a large fixed completion latency once the number
+  // of chunks in a single `cuMemBatchDecompressAsync` batch exceeds an internal threshold. Splitting
+  // an oversized batch into several smaller batched calls avoids that cliff. `LIBCUDF_DE_MAX_CHUNKS_
+  // PER_CALL` sets the maximum chunks per nvcomp call; 0 (default) or unset means no split (a single
+  // call, the original behavior). The sub-calls are issued back-to-back on the same stream.
+  auto const max_chunks_per_call = [] {
+    auto const* const env = std::getenv("LIBCUDF_DE_MAX_CHUNKS_PER_CALL");
+    return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : size_t{0};
+  }();
+  auto const batch_size =
+    (max_chunks_per_call > 0) ? std::min(max_chunks_per_call, num_chunks) : num_chunks;
 
-  auto const nvcomp_status = batched_decompress_async(compression,
-                                                      use_hw_decompression(),
-                                                      nvcomp_args.input_data_ptrs.data(),
-                                                      nvcomp_args.input_data_sizes.data(),
-                                                      nvcomp_args.output_data_sizes.data(),
-                                                      actual_uncompressed_data_sizes.data(),
-                                                      num_chunks,
-                                                      scratch.data(),
-                                                      scratch.size(),
-                                                      nvcomp_args.output_data_ptrs.data(),
-                                                      nvcomp_statuses.data(),
-                                                      stream.value());
-  CHECK_NVCOMP_STATUS(nvcomp_status);
+  for (size_t offset = 0; offset < num_chunks; offset += batch_size) {
+    auto const batch_chunks = std::min(batch_size, num_chunks - offset);
+
+    // Label each DE dispatch with its chunk count so the batch split is visible in nsys.
+    auto const range_name = "nvcomp_batched_decompress: " + std::to_string(batch_chunks) + " chunks";
+    cudf::scoped_range const batch_range{range_name.c_str()};
+
+    // Temporary space required for decompression of this sub-batch
+    auto const temp_size = batched_decompress_temp_size_ex(
+      compression,
+      device_span<void const* const>{nvcomp_args.input_data_ptrs.data() + offset, batch_chunks},
+      device_span<size_t const>{nvcomp_args.input_data_sizes.data() + offset, batch_chunks},
+      max_uncomp_chunk_size,
+      max_total_uncomp_size,
+      stream);
+    rmm::device_buffer scratch(temp_size, stream);
+
+    auto const nvcomp_status =
+      batched_decompress_async(compression,
+                               use_hw_decompression(),
+                               nvcomp_args.input_data_ptrs.data() + offset,
+                               nvcomp_args.input_data_sizes.data() + offset,
+                               nvcomp_args.output_data_sizes.data() + offset,
+                               actual_uncompressed_data_sizes.data() + offset,
+                               batch_chunks,
+                               scratch.data(),
+                               scratch.size(),
+                               nvcomp_args.output_data_ptrs.data() + offset,
+                               nvcomp_statuses.data() + offset,
+                               stream.value());
+    CHECK_NVCOMP_STATUS(nvcomp_status);
+  }
 
   update_compression_results(nvcomp_statuses, actual_uncompressed_data_sizes, results, stream);
 }
