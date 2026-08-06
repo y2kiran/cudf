@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 
@@ -610,6 +611,12 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
     device_span<device_span<uint8_t> const> d_comp_out_view(d_comp_out.data() + start_pos,
                                                             codec.num_pages);
     device_span<codec_exec_result> d_comp_res_view(comp_res.data() + start_pos, codec.num_pages);
+
+    // Experiment (LIBCUDF_SYNC_BEFORE_DECOMPRESS): drain the stream immediately before the
+    // decompress call so the decompress (e.g. hardware DE) dispatch starts from an idle GPU,
+    // isolating it from any prior queued work. Default (unset) leaves behavior unchanged.
+    if (std::getenv("LIBCUDF_SYNC_BEFORE_DECOMPRESS") != nullptr) { stream.synchronize(); }
+
     cudf::io::detail::decompress(from_parquet_compression(codec.compression_type),
                                  d_comp_in_view,
                                  d_comp_out_view,
