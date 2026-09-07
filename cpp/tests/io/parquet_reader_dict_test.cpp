@@ -186,6 +186,27 @@ cudf::test::strings_column_wrapper make_strings_with_null_row_group()
   return cudf::test::strings_column_wrapper(strings.begin(), strings.end(), valids.begin());
 }
 
+// A flat string column whose row groups all carry the *same* dictionary. Each row group opens with
+// the full value set in a fixed order, so the writer's per-row-group dictionaries are identical
+// entry-for-entry -- the case the transcode's identical-dictionary shortcut targets.
+cudf::test::strings_column_wrapper make_strings_with_identical_row_group_dicts()
+{
+  constexpr int num_distinct_values = 4;
+  std::mt19937 engine(seed);
+  std::uniform_int_distribution<int> value_dist(0, num_distinct_values - 1);
+
+  std::vector<std::string> strings(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    // Seed every row group with values 0..N-1 in order, then fill the rest randomly, so each row
+    // group's dictionary holds the same entries in the same (first-occurrence) order.
+    auto const pos_in_row_group = i % row_group_size;
+    auto const value =
+      pos_in_row_group < num_distinct_values ? pos_in_row_group : value_dist(engine);
+    strings[i] = make_value_string(value);
+  }
+  return cudf::test::strings_column_wrapper(strings.begin(), strings.end());
+}
+
 }  // namespace
 
 struct ParquetReaderDictTest : public cudf::test::BaseFixture {};
@@ -595,6 +616,35 @@ TEST_F(ParquetReaderDictTest, NullRowGroupDictTranscode)
     cudf::distinct_count(keys, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID);
   EXPECT_EQ(num_distinct, keys.size());
   EXPECT_LE(keys.size(), cardinality);
+
+  auto const decoded = cudf::dictionary::decode(dict_view);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(input_col, decoded->view());
+}
+
+// Every row group carries an identical dictionary, so the assembly can staple the shared key set
+// onto the decoded indices without stacking, deduplicating or remapping. The result must still be a
+// DICTIONARY32 with unique keys that decodes back to the input.
+TEST_F(ParquetReaderDictTest, IdenticalRowGroupDictsDictTranscode)
+{
+  auto input_col = make_strings_with_identical_row_group_dicts();
+
+  auto const input_tbl = cudf::table_view{{input_col}};
+  auto const filepath = temp_env->get_temp_filepath("IdenticalRowGroupDictsDictTranscode.parquet");
+  write_parquet(input_tbl, filepath);  // row_group_size rows/group -> multiple row groups
+
+  auto const read_table = read_parquet_as_dict(filepath).tbl;
+  ASSERT_EQ(read_table->num_rows(), num_rows);
+  ASSERT_EQ(read_table->num_columns(), 1);
+
+  auto const read_col = read_table->view().column(0);
+  ASSERT_EQ(read_col.type().id(), cudf::type_id::DICTIONARY32);
+
+  cudf::dictionary_column_view const dict_view(read_col);
+  auto const keys = dict_view.keys();
+
+  auto const num_distinct =
+    cudf::distinct_count(keys, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID);
+  EXPECT_EQ(num_distinct, keys.size());
 
   auto const decoded = cudf::dictionary::decode(dict_view);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(input_col, decoded->view());
