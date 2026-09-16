@@ -407,6 +407,11 @@ struct codec_stats {
   size_t num_pages              = 0;
   int32_t max_decompressed_size = 0;
   size_t total_decomp_size      = 0;
+  // Pre-decompression (on-disk/compressed) byte total for this codec's pages. Only accumulated
+  // when the CUDF_SOL_LOGGING environment variable is set -- see log-volume-plan.md section 3.6
+  // -- since it costs one extra add per page in add_pages()'s existing loop and has no use
+  // outside that diagnostic.
+  size_t total_comp_size = 0;
 
   enum class page_selection { DICT_PAGES, NON_DICT_PAGES };
 

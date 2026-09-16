@@ -14,6 +14,7 @@
 #include <cudf/detail/stream_compaction.hpp>
 #include <cudf/detail/structs/utilities.hpp>
 #include <cudf/detail/transform.hpp>
+#include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/dictionary/detail/encode.hpp>
 #include <cudf/io/parquet_schema.hpp>
@@ -29,11 +30,97 @@
 
 #include <bitset>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
 
 namespace cudf::io::parquet::detail {
+
+namespace {
+
+// Human-readable name for a single decode_kernel_mask bit, for CUDF_SOL_LOGGING output only.
+std::string kernel_mask_name(decode_kernel_mask mask)
+{
+  switch (mask) {
+    case decode_kernel_mask::GENERAL: return "GENERAL";
+    case decode_kernel_mask::STRING: return "STRING";
+    case decode_kernel_mask::DELTA_BINARY: return "DELTA_BINARY";
+    case decode_kernel_mask::DELTA_BYTE_ARRAY: return "DELTA_BYTE_ARRAY";
+    case decode_kernel_mask::DELTA_LENGTH_BA: return "DELTA_LENGTH_BA";
+    case decode_kernel_mask::FIXED_WIDTH_NO_DICT: return "FIXED_WIDTH_NO_DICT";
+    case decode_kernel_mask::FIXED_WIDTH_DICT: return "FIXED_WIDTH_DICT";
+    case decode_kernel_mask::BYTE_STREAM_SPLIT: return "BYTE_STREAM_SPLIT";
+    case decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_FLAT:
+      return "BYTE_STREAM_SPLIT_FIXED_WIDTH_FLAT";
+    case decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_NESTED:
+      return "BYTE_STREAM_SPLIT_FIXED_WIDTH_NESTED";
+    case decode_kernel_mask::FIXED_WIDTH_NO_DICT_NESTED: return "FIXED_WIDTH_NO_DICT_NESTED";
+    case decode_kernel_mask::FIXED_WIDTH_DICT_NESTED: return "FIXED_WIDTH_DICT_NESTED";
+    case decode_kernel_mask::FIXED_WIDTH_DICT_LIST: return "FIXED_WIDTH_DICT_LIST";
+    case decode_kernel_mask::FIXED_WIDTH_NO_DICT_LIST: return "FIXED_WIDTH_NO_DICT_LIST";
+    case decode_kernel_mask::BYTE_STREAM_SPLIT_FIXED_WIDTH_LIST:
+      return "BYTE_STREAM_SPLIT_FIXED_WIDTH_LIST";
+    case decode_kernel_mask::BOOLEAN: return "BOOLEAN";
+    case decode_kernel_mask::BOOLEAN_NESTED: return "BOOLEAN_NESTED";
+    case decode_kernel_mask::BOOLEAN_LIST: return "BOOLEAN_LIST";
+    case decode_kernel_mask::STRING_NESTED: return "STRING_NESTED";
+    case decode_kernel_mask::STRING_LIST: return "STRING_LIST";
+    case decode_kernel_mask::STRING_DICT: return "STRING_DICT";
+    case decode_kernel_mask::STRING_DICT_NESTED: return "STRING_DICT_NESTED";
+    case decode_kernel_mask::STRING_DICT_LIST: return "STRING_DICT_LIST";
+    case decode_kernel_mask::STRING_STREAM_SPLIT: return "STRING_STREAM_SPLIT";
+    case decode_kernel_mask::STRING_STREAM_SPLIT_NESTED: return "STRING_STREAM_SPLIT_NESTED";
+    case decode_kernel_mask::STRING_STREAM_SPLIT_LIST: return "STRING_STREAM_SPLIT_LIST";
+    case decode_kernel_mask::DICT_INT32: return "DICT_INT32";
+    case decode_kernel_mask::NONE:
+    default: return "NONE";
+  }
+}
+
+// CUDF_SOL_LOGGING diagnostic (see log-volume-plan.md section 3.4): for each output column
+// touched by this decode pass, log which decode kernel(s) processed its pages and how many
+// pages each, plus the decode-kernel input byte total (section 3.5's input-volume half --
+// PageInfo::uncompressed_page_size is exactly a page's decode-kernel input size, already
+// resident on the host, so this is a one-line addition to the same aggregation rather than a
+// separate pass). A column's pages are NOT necessarily all decoded by the same kernel -- e.g. a
+// column can mix dictionary-encoded and plain-encoded row groups -- so this reports a set of
+// (kernel, page_count, input_bytes) tuples per column, not a single kernel per column. Purely a
+// host-side aggregation over data that is already computed and resident on the host by the time
+// decode_page_data() runs; no new device computation.
+void log_per_column_kernel_masks(cudf::detail::hostdevice_vector<PageInfo> const& pages,
+                                 cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
+                                 std::vector<input_column_info> const& input_columns)
+{
+  struct kernel_tally {
+    int64_t pages       = 0;
+    int64_t input_bytes = 0;
+  };
+  std::map<int, std::map<decode_kernel_mask, kernel_tally>> per_column;  // col idx -> mask -> tally
+
+  for (size_t i = 0; i < pages.size(); ++i) {
+    auto const& page = pages[i];
+    if (page.kernel_mask == decode_kernel_mask::NONE) continue;
+    auto const col_idx    = chunks[static_cast<size_t>(page.chunk_idx)].src_col_index;
+    auto& tally            = per_column[col_idx][page.kernel_mask];
+    tally.pages           += 1;
+    tally.input_bytes      += page.uncompressed_page_size;
+  }
+
+  for (auto const& [col_idx, kernel_counts] : per_column) {
+    auto const& name = input_columns[static_cast<size_t>(col_idx)].name;
+    for (auto const& [mask, tally] : kernel_counts) {
+      CUDF_LOG_INFO(
+        "CUDF_SOL_LOGGING column=%s kernel=%s pages=%lld input_bytes_uncompressed=%lld",
+        name.c_str(),
+        kernel_mask_name(mask).c_str(),
+        static_cast<long long>(tally.pages),
+        static_cast<long long>(tally.input_bytes));
+    }
+  }
+}
+
+}  // namespace
 
 void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_rows)
 {
@@ -57,6 +144,13 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
 
   auto const kernel_mask = subpass.kernel_mask;
   auto const has_strings = (kernel_mask & STRINGS_MASK) != 0;
+
+  // CUDF_SOL_LOGGING diagnostic -- see log_per_column_kernel_masks() above (log-volume-plan.md
+  // section 3.4/3.5). Env var read once per process (function-local static), not once per call.
+  {
+    static bool const sol_logging = cudf::detail::get_bool_env_or("CUDF_SOL_LOGGING", false);
+    if (sol_logging) { log_per_column_kernel_masks(subpass.pages, pass.chunks, _input_columns); }
+  }
 
   // Check to see if there are any string columns present. If so, then we need to get size info
   // for each string page. This size info will be used to pre-allocate memory for the column,

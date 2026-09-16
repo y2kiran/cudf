@@ -14,8 +14,10 @@
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/batched_memcpy.hpp>
+#include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/logger.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/exec_policy.hpp>
@@ -123,6 +125,11 @@ void codec_stats::add_pages(host_span<ColumnChunkDesc const> chunks,
                             page_selection selection,
                             host_span<bool const> page_mask)
 {
+  // Checked once per call (not per page): whether to also accumulate pre-decompression byte
+  // totals for CUDF_SOL_LOGGING (log-volume-plan.md section 3.6). Cached so the flag is only
+  // ever read from the environment once per process.
+  static bool const sol_logging = cudf::detail::get_bool_env_or("CUDF_SOL_LOGGING", false);
+
   auto page_mask_iter = cudf::detail::make_counting_transform_iterator(
     0, [&](size_t page_idx) { return page_mask.empty() ? true : page_mask[page_idx]; });
 
@@ -141,6 +148,7 @@ void codec_stats::add_pages(host_span<ColumnChunkDesc const> chunks,
       ++num_pages;
       total_decomp_size += page.uncompressed_page_size;
       max_decompressed_size = std::max(max_decompressed_size, page.uncompressed_page_size);
+      if (sol_logging) { total_comp_size += page.compressed_page_size; }
     }
   });
 }
@@ -499,6 +507,23 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
     // at this point, the codec contains info for both dictionary pass pages and data subpass pages
     total_decomp_size += codec.total_decomp_size;
     num_comp_pages += codec.num_pages;
+  }
+
+  // CUDF_SOL_LOGGING diagnostic (log-volume-plan.md section 3.6): per-codec pre/post
+  // decompression byte totals. `codec.total_comp_size` is only accumulated by add_pages() when
+  // this same env var is set (see codec_stats::add_pages above), so this is otherwise a no-op
+  // read of an always-zero field -- no extra work here beyond the env var check itself, which
+  // add_pages() already caches as a function-local static.
+  if (cudf::detail::get_bool_env_or("CUDF_SOL_LOGGING", false)) {
+    for (auto const& codec : codecs) {
+      if (codec.num_pages == 0) continue;
+      CUDF_LOG_INFO(
+        "CUDF_SOL_LOGGING codec=%s pages=%zu compressed_in_bytes=%zu decompressed_out_bytes=%zu",
+        parquet_compression_name(codec.compression_type).c_str(),
+        codec.num_pages,
+        codec.total_comp_size,
+        codec.total_decomp_size);
+    }
   }
 
   // Dispatch batches of pages to decompress for each codec.
