@@ -88,7 +88,7 @@ std::string kernel_mask_name(decode_kernel_mask mask)
 // (kernel, page_count, input_bytes) tuples per column, not a single kernel per column. Purely a
 // host-side aggregation over data that is already computed and resident on the host by the time
 // decode_page_data() runs; no new device computation.
-void log_per_column_kernel_masks(cudf::detail::hostdevice_vector<PageInfo> const& pages,
+void log_per_column_kernel_masks(cudf::detail::hostdevice_span<PageInfo> const& pages,
                                  cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
                                  std::vector<input_column_info> const& input_columns)
 {
@@ -110,7 +110,7 @@ void log_per_column_kernel_masks(cudf::detail::hostdevice_vector<PageInfo> const
   for (auto const& [col_idx, kernel_counts] : per_column) {
     auto const& name = input_columns[static_cast<size_t>(col_idx)].name;
     for (auto const& [mask, tally] : kernel_counts) {
-      CUDF_LOG_INFO(
+      CUDF_LOG_WARN(
         "CUDF_SOL_LOGGING column=%s kernel=%s pages=%lld input_bytes_uncompressed=%lld",
         name.c_str(),
         kernel_mask_name(mask).c_str(),
@@ -147,7 +147,7 @@ void log_per_column_output_bytes(std::vector<cudf::io::detail::inline_column_buf
     // 1:1 correspondence doesn't hold.
     auto const label = (i < input_columns.size()) ? input_columns[i].name
                                                    : ("output_col_" + std::to_string(i));
-    CUDF_LOG_INFO("CUDF_SOL_LOGGING column=%s output_bytes=%zu",
+    CUDF_LOG_WARN("CUDF_SOL_LOGGING column=%s output_bytes=%zu",
                   label.c_str(),
                   output_buffer_bytes(output_buffers[i]));
   }

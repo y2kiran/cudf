@@ -517,7 +517,7 @@ std::vector<row_range> compute_page_splits_by_row(device_span<cumulative_page_in
   if (cudf::detail::get_bool_env_or("CUDF_SOL_LOGGING", false)) {
     for (auto const& codec : codecs) {
       if (codec.num_pages == 0) continue;
-      CUDF_LOG_INFO(
+      CUDF_LOG_WARN(
         "CUDF_SOL_LOGGING codec=%s pages=%zu compressed_in_bytes=%zu decompressed_out_bytes=%zu",
         parquet_compression_name(codec.compression_type).c_str(),
         codec.num_pages,
