@@ -120,6 +120,39 @@ void log_per_column_kernel_masks(cudf::detail::hostdevice_vector<PageInfo> const
   }
 }
 
+// CUDF_SOL_LOGGING diagnostic (log-volume-plan.md section 3.5, coarse per-column total):
+// decoded output bytes (data + validity + string chars, recursing into nested children) for
+// each top-level output column, after decode has fully completed. This does NOT attribute
+// output bytes to a specific kernel_mask the way log_per_column_kernel_masks() attributes
+// input bytes -- true per-(column, kernel) output attribution needs proportional estimation
+// for columns whose pages split across more than one kernel, deferred per the plan's
+// recommendation to ship the coarse total first.
+size_t output_buffer_bytes(cudf::io::detail::inline_column_buffer& buf)
+{
+  // null_mask_size() isn't const-qualified upstream (column_buffer_base), so this helper takes
+  // a non-const reference to match -- it doesn't mutate anything, just reads sizes.
+  size_t bytes = buf.data_size() + buf.null_mask_size() + buf.string_size();
+  for (auto& child : buf.children)
+    bytes += output_buffer_bytes(child);
+  return bytes;
+}
+
+void log_per_column_output_bytes(std::vector<cudf::io::detail::inline_column_buffer>& output_buffers,
+                                 std::vector<input_column_info> const& input_columns)
+{
+  for (size_t i = 0; i < output_buffers.size(); ++i) {
+    // Output buffers and input columns correspond 1:1, in order, for flat (non-nested) schemas
+    // -- true for every dataset this diagnostic has been used against so far (TPC-H/TPC-DS).
+    // Falls back to an index label rather than guessing a name for nested schemas where that
+    // 1:1 correspondence doesn't hold.
+    auto const label = (i < input_columns.size()) ? input_columns[i].name
+                                                   : ("output_col_" + std::to_string(i));
+    CUDF_LOG_INFO("CUDF_SOL_LOGGING column=%s output_bytes=%zu",
+                  label.c_str(),
+                  output_buffer_bytes(output_buffers[i]));
+  }
+}
+
 }  // namespace
 
 void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_rows)
@@ -588,6 +621,14 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
   }
 
   _stream.sync();
+
+  // CUDF_SOL_LOGGING: coarse per-column output byte totals (log-volume-plan.md section 3.5).
+  // Must run after the sync above -- _output_buffers aren't guaranteed valid/final until the
+  // decode kernels this function launched have actually completed.
+  {
+    static bool const sol_logging = cudf::detail::get_bool_env_or("CUDF_SOL_LOGGING", false);
+    if (sol_logging) { log_per_column_output_bytes(_output_buffers, _input_columns); }
+  }
 }
 
 reader_impl::reader_impl() : _stream{cudaStream_t{cudaStreamDefault}}, _options{} {}
