@@ -1,0 +1,4 @@
+cpp/build
+python/build
+python/*/build
+python/*/*.egg-info
