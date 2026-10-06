@@ -61,16 +61,14 @@ struct level_scan_state {
   CUDF_PARQUET_PAGE_STATE_ERROR_METHODS
 };
 
-// Composition D: string offset preprocess (flat scan with progress tracking).
+// Composition D: string offset preprocess (one independent state per page warp).
 // Used by: preprocess_string_offsets.
-// Includes setup (page metadata + error), stream (page bytes + dictionary), and
-// progress (input counters) because this pass scans flat string payloads while tracking counts.
-// FLBA (FIXED_LEN_BYTE_ARRAY) pages return before setup_local_page_info runs, and
-// non-FLBA setup writes conversion scratch that this kernel never reads, so it stays out.
+// Includes setup (page metadata + error) and stream (page bytes + dictionary).
+// The scanner keeps its own counters in registers and does not use decode progress or output
+// conversion state. FLBA pages return before setup_local_page_info runs.
 struct string_offset_scan_state {
   page_decode_setup_state setup;
   page_decode_stream_state stream;
-  page_decode_progress_state progress;
   CUDF_PARQUET_PAGE_STATE_ERROR_METHODS
 };
 #undef CUDF_PARQUET_PAGE_STATE_ERROR_METHODS

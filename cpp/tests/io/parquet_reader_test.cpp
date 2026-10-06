@@ -88,6 +88,59 @@ TEST_F(ParquetReaderTest, ManyTinyStringPages)
   CUDF_TEST_EXPECT_TABLES_EQUAL(input, result.tbl->view());
 }
 
+TEST_F(ParquetReaderTest, PlainStringOffsetsAcrossPages)
+{
+  constexpr cudf::size_type num_rows = 513;
+  std::vector<std::string> long_strings(num_rows, std::string(256, 'a'));
+  std::vector<std::string> skewed_strings;
+  std::vector<bool> validity(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    validity[i] = i % 4 == 0;
+    skewed_strings.push_back(std::string(i % 10 == 0 ? 432 : i % 7, 'b'));
+  }
+  cudf::test::strings_column_wrapper nullable(
+    long_strings.begin(), long_strings.end(), validity.begin());
+  cudf::test::strings_column_wrapper skewed(skewed_strings.begin(), skewed_strings.end());
+  auto const no_valid_values =
+    cudf::detail::make_counting_transform_iterator(0, [](auto) { return false; });
+  cudf::test::strings_column_wrapper all_null(
+    long_strings.begin(), long_strings.end(), no_valid_values);
+  cudf::table_view const input{{nullable, skewed, all_null}};
+  cudf::io::table_input_metadata metadata(input);
+  for (auto& column : metadata.column_metadata) {
+    column.set_encoding(cudf::io::column_encoding::PLAIN);
+  }
+
+  for (bool const v2 : {false, true}) {
+    for (auto const statistics : {cudf::io::statistics_freq::STATISTICS_NONE,
+                                  cudf::io::statistics_freq::STATISTICS_COLUMN}) {
+      SCOPED_TRACE(v2);
+      SCOPED_TRACE(static_cast<int>(statistics));
+      std::vector<char> buffer;
+      cudf::io::write_parquet(
+        cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&buffer}, input)
+          .metadata(metadata)
+          .compression(cudf::io::compression_type::NONE)
+          .dictionary_policy(cudf::io::dictionary_policy::NEVER)
+          .write_v2_headers(v2)
+          .stats_level(statistics)
+          .max_page_size_rows(128)
+          .max_page_fragment_size(128));
+
+      for (auto const [skip, count] : page_boundary_slices(num_rows)) {
+        auto const result = cudf::io::read_parquet(
+          cudf::io::parquet_reader_options::builder(cudf::io::source_info{
+            cudf::host_span<std::byte const>{reinterpret_cast<std::byte const*>(buffer.data()),
+                                             buffer.size()}})
+            .skip_rows(skip)
+            .num_rows(count));
+        auto const expected = cudf::slice(input, {skip, skip + count});
+        CUDF_TEST_EXPECT_TABLES_EQUAL(expected.front(), result.tbl->view());
+      }
+    }
+  }
+}
+
 TEST_F(ParquetReaderTest, UserBounds)
 {
   // trying to read more rows than there are should result in

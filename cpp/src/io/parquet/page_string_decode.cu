@@ -7,6 +7,7 @@
 #include "error.hpp"
 #include "page_decode.cuh"
 #include "page_state_composed.cuh"
+#include "page_string_offsets.cuh"
 #include "page_string_utils.cuh"
 
 #include <cudf/detail/algorithms/reduce.cuh>
@@ -1061,307 +1062,78 @@ void compute_page_string_sizes_pass2(cudf::detail::hostdevice_span<PageInfo> pag
 }
 
 /**
- * @brief Helper function to prefetch next chunk of data into shared memory using multiple threads
+ * @brief Precompute PLAIN string offsets with an independent page per warp.
  *
- * @param t Thread index within block
- * @param next_length_offset Current offset in the data stream
- * @param dict_size Total size of the dictionary/data
- * @param cur Pointer to the start of the data
- * @param prefetch_buffer Shared memory buffer for prefetching
- * @param[in,out] buffer_base Offset corresponding to the start of the prefetched buffer
- * @param[in,out] buffer_end Offset corresponding to the end of the prefetched buffer
- * @return Whether the buffer contains valid data
+ * Each warp owns its setup state and prefetch buffer. All synchronization in page setup and
+ * scanning is warp-local, so filtered pages and a partially filled final block can return early.
  */
-template <int32_t prefetch_size, int32_t block_size>
-inline __device__ bool prefetch_string_data(int t,
-                                            int32_t next_length_offset,
-                                            int32_t dict_size,
-                                            uint8_t const* cur,
-                                            uint8_t* prefetch_buffer,
-                                            int32_t& buffer_base,
-                                            int32_t& buffer_end)
-{
-  // The start of the prefetched buffer is the offset to the next length in the data stream
-  buffer_base = next_length_offset;
-
-  int32_t const total_bytes_to_copy = cuda::std::min(prefetch_size, dict_size - buffer_base);
-  if (total_bytes_to_copy <= 0) { return false; }  // No data left to copy
-  buffer_end = buffer_base + total_bytes_to_copy;
-
-  // Nominally, each thread will copy an equal number of bytes; this rounds up.
-  auto const nominal_thread_bytes_to_copy =
-    cudf::util::div_rounding_up_unsafe<int32_t>(total_bytes_to_copy, block_size);
-  int32_t const thread_offset = nominal_thread_bytes_to_copy * t;
-
-  if (thread_offset < total_bytes_to_copy) {
-    // Guard against the end of the data stream
-    int32_t const thread_bytes_to_copy =
-      cuda::std::min(nominal_thread_bytes_to_copy, total_bytes_to_copy - thread_offset);
-
-    if (thread_bytes_to_copy > 0) {
-      int32_t const thread_copy_from_index = buffer_base + thread_offset;
-      cuda::std::memcpy(reinterpret_cast<void*>(&prefetch_buffer[thread_offset]),
-                        reinterpret_cast<void const*>(&cur[thread_copy_from_index]),
-                        thread_bytes_to_copy);
-    }
-  }
-  return true;
-}
-
-/**
- * @brief Read string offsets with buffering and prefetching
- *
- * This function uses a prefetch buffer to efficiently process string offsets by
- * reading data in chunks. Thread 0 reads string lengths, and all threads cooperate
- * on prefetching data and filling the remaining entries.
- *
- * @param s Page state containing data_start, dict_size and other info
- * @param num_values_to_process Number of values to process
- * @param str_offsets Output buffer for string offsets
- * @param error_code Error code to set if a string length overruns the page
- */
-template <int32_t block_size, size_t prefetch_size>
-inline __device__ void read_string_offsets_buffered(auto* s,
-                                                    size_t num_values_to_process,
-                                                    uint32_t* str_offsets,
-                                                    kernel_error::pointer error_code)
-{
-  auto const block     = cg::this_thread_block();
-  int const t          = block.thread_rank();
-  uint8_t const* cur   = s->stream.data_start;
-  auto const dict_size = s->stream.dict_size;
-
-  int32_t buffer_base        = 0;
-  int32_t buffer_end         = 0;
-  int32_t next_length_offset = 0;
-  __shared__ __align__(128) uint8_t prefetch_buffer[prefetch_size];
-
-  // Initial prefetch
-  if (!prefetch_string_data<prefetch_size, block_size>(
-        t, next_length_offset, dict_size, cur, prefetch_buffer, buffer_base, buffer_end)) {
-    return;  // No data to process
-  }
-  block.sync();  // Sync all of the prefetched data for all of the threads
-
-  // Parquet data is: 4-byte length, string, 4-byte length, string, ...
-  size_t num_values_written = num_values_to_process;  // Will update below if run out of data
-  for (size_t pos = 0; pos < num_values_to_process; pos++) {
-    int32_t const string_offset = next_length_offset + sizeof(int32_t);
-    // Natural end-of-data exit: we've consumed all the value bytes, so the next length prefix
-    // would begin at or past the end of the data -- it doesn't exist. Nothing left to read.
-    if (string_offset > dict_size) {
-      num_values_written = pos;  // Reached the end of the data
-      break;
-    }
-
-    // Check if we need to prefetch more data
-    if ((next_length_offset + sizeof(int32_t)) > buffer_end) {
-      block.sync();  // Make sure all of the threads have finished reading the previous data
-      if (!prefetch_string_data<prefetch_size, block_size>(
-            t, next_length_offset, dict_size, cur, prefetch_buffer, buffer_base, buffer_end)) {
-        num_values_written = pos;  // End of the data
-        break;
-      }
-      block.sync();  // Sync all of the prefetched data for all of the threads
-    }
-
-    // Read the length of the string from the prefetched buffer
-    int32_t const prefetch_read_index = next_length_offset - buffer_base;
-    int32_t len;
-    cuda::std::memcpy(reinterpret_cast<void*>(&len),
-                      reinterpret_cast<void const*>(&prefetch_buffer[prefetch_read_index]),
-                      sizeof(int32_t));
-
-    // Genuine corruption: the length prefix is not a valid in-page size. This covers a length
-    // that claims more bytes than remain in the page, and a negative length (never valid in PLAIN,
-    // e.g. from a stray byte shifting the length window). The sum is widened to 64 bits so a
-    // near-INT_MAX corrupt length cannot overflow the comparison itself (int32 overflow is UB).
-    if (len < 0 || static_cast<int64_t>(string_offset) + len > dict_size) {
-      num_values_written = pos;  // Data is corrupted or incomplete
-      cg::invoke_one(block, [&]() {
-        set_error(static_cast<kernel_error::value_type>(decode_error::STRING_DATA_OVERRUN),
-                  error_code);
-      });
-      break;
-    }
-    next_length_offset = string_offset + len;
-
-    cg::invoke_one(block, [&]() { str_offsets[pos] = string_offset; });
-  }
-
-  // +4 for "stored" length of "next" string that we'll subtract off during decode
-  // Easier/faster than branching in the decode loop
-  int32_t const last_string_offset = next_length_offset + sizeof(int32_t);
-
-  // Use all threads in the block to fill remaining entries with the last offset
-  // This fills in the rest if we break early above because the dictionary wasn't large enough
-  // But it also fills in the last offset for the page, hence the +1 in the loop limit.
-  for (size_t pos = num_values_written + t; pos < num_values_to_process + 1; pos += block_size) {
-    str_offsets[pos] = last_string_offset;
-  }
-}
-
-/**
- * @brief Read string offsets without buffering for large average string lengths
- *
- * This function handles the case where the average string length is too large
- * to use the buffering approach. Thread 0 sequentially reads all string lengths,
- * then all threads cooperatively fill the remaining entries.
- *
- * @param s Page state containing data_start, dict_size and other info
- * @param num_values_to_process Number of values to process
- * @param str_offsets Output buffer for string offsets
- * @param error_code Error code to set if a string length overruns the page
- */
-template <int32_t block_size>
-inline __device__ void read_string_offsets_sequential(auto* s,
-                                                      size_t num_values_to_process,
-                                                      uint32_t* str_offsets,
-                                                      kernel_error::pointer error_code)
-{
-  auto const block = cg::this_thread_block();
-  int const t      = block.thread_rank();
-
-  __shared__ size_t num_values_written;
-  __shared__ uint32_t last_offset;  // offset into data_start
-
-  cg::invoke_one(block, [&]() {
-    uint8_t const* cur     = s->stream.data_start;
-    uint32_t length_offset = 0;
-    auto const dict_size   = s->stream.dict_size;
-
-    // Process the data
-    // Parquet data is: 4-byte length, string, 4-byte length, string, ...
-    num_values_written = num_values_to_process;  // Will update below if run out of data
-    for (size_t pos = 0; pos < num_values_to_process; pos++) {
-      uint32_t const string_offset = length_offset + sizeof(int32_t);
-      // Natural end-of-data exit: we've consumed all the value bytes, so the next length prefix
-      // would begin at or past the end of the data -- it doesn't exist. Nothing left to read.
-      if (string_offset > dict_size) {
-        num_values_written = pos;  // Reached the end of the data
-        break;
-      }
-
-      // Read the length of the string from the data stream
-      int32_t len;
-      cuda::std::memcpy(reinterpret_cast<void*>(&len),
-                        reinterpret_cast<void const*>(&cur[length_offset]),
-                        sizeof(int32_t));
-
-      // Genuine corruption: the length prefix is not a valid in-page size. This covers a length
-      // that claims more bytes than remain in the page, and a negative length (never valid in
-      // PLAIN, e.g. from a stray byte shifting the length window). The sum is widened to 64 bits so
-      // a near-INT_MAX corrupt length cannot overflow the comparison itself (int32 overflow is UB).
-      if (len < 0 || static_cast<int64_t>(string_offset) + len > dict_size) {
-        num_values_written = pos;  // Data is corrupted or incomplete
-        set_error(static_cast<kernel_error::value_type>(decode_error::STRING_DATA_OVERRUN),
-                  error_code);
-        break;
-      }
-      str_offsets[pos] = string_offset;
-      length_offset    = string_offset + len;
-    }
-
-    // +4 for "stored" length of "next" string that we'll subtract off during decode
-    last_offset = length_offset + sizeof(int32_t);
-  });
-
-  block.sync();  // Ensure all threads see num_values_written
-
-  // Use all threads in the block to fill remaining entries with the last offset
-  // This fills in the rest if we break early above because the dictionary wasn't large enough
-  // But it also fills in the last offset for the page, hence the +1 in the loop limit.
-  for (size_t pos = num_values_written + t; pos < num_values_to_process + 1; pos += block_size) {
-    str_offsets[pos] = last_offset;
-  }
-}
-
-/**
- * @brief Pre-processing kernel to fill string offsets for non-dictionary string columns
- *
- * This kernel runs before the main decode kernel to pre-compute string offsets
- * for columns that use plain encoding without dictionaries.
- *
- * @param pages List of pages
- * @param chunks List of column chunks
- * @param page_string_offset_indices Device span of offsets, indexed per-page, into the column's
- * string offset buffer
- * @param page_mask Boolean vector indicating which pages need to be processed
- * @param min_row Minimum row index to read
- * @param num_rows Number of rows to read starting from min_row
- * @param error_code Error code to set if string data is corrupted
- */
-template <int decode_block_size, size_t prefetch_size>
+template <int warps_per_block>
 CUDF_KERNEL void preprocess_string_offsets_kernel(
-  PageInfo* pages,
+  device_span<PageInfo const> pages,
   device_span<ColumnChunkDesc const> chunks,
   device_span<size_t const> page_string_offset_indices,
-  cudf::device_span<bool const> page_mask,
+  device_span<bool const> page_mask,
   size_t min_row,
   size_t num_rows,
   kernel_error::pointer error_code)
 {
-  int const page_idx = cg::this_grid().block_rank();
-  PageInfo* const pp = &pages[page_idx];
+  auto const warp     = cg::tiled_partition<cudf::detail::warp_size>(cg::this_thread_block());
+  auto const warp_idx = warp.meta_group_rank();
+  auto const page_idx = size_t{blockIdx.x} * warps_per_block + warp_idx;
+  if (page_idx >= pages.size() || (!page_mask.empty() && !page_mask[page_idx])) { return; }
 
-  // Don't process pages that don't need to be decoded
-  if (not page_mask.empty() and not page_mask[page_idx]) { return; }
-
+  constexpr uint32_t string_mask = BitOr(decode_kernel_mask::STRING,
+                                         decode_kernel_mask::STRING_NESTED,
+                                         decode_kernel_mask::STRING_LIST,
+                                         decode_kernel_mask::STRING_STREAM_SPLIT,
+                                         decode_kernel_mask::STRING_STREAM_SPLIT_NESTED,
+                                         decode_kernel_mask::STRING_STREAM_SPLIT_LIST);
+  auto const* pp                 = &pages[page_idx];
+  if ((pp->flags & PAGEINFO_FLAGS_DICTIONARY) != 0 || !mask_filter{string_mask}(*pp)) { return; }
   auto const& chunk = chunks[pp->chunk_idx];
-  if (chunk.physical_type == Type::FIXED_LEN_BYTE_ARRAY) {
-    return;  // String lengths, and thus offsets are fixed, no need to preprocess
-  }
+  if (chunk.physical_type == Type::FIXED_LEN_BYTE_ARRAY) { return; }
 
-  // Check if this is a string column without dictionary using kernel mask
-  constexpr uint32_t STRINGS_MASK_NON_DELTA_NON_DICT =
-    BitOr(decode_kernel_mask::STRING,
-          decode_kernel_mask::STRING_NESTED,
-          decode_kernel_mask::STRING_LIST,
-          decode_kernel_mask::STRING_STREAM_SPLIT,
-          decode_kernel_mask::STRING_STREAM_SPLIT_NESTED,
-          decode_kernel_mask::STRING_STREAM_SPLIT_LIST);
-
-  __shared__ __align__(16) string_offset_scan_state state_g;
-  auto* const s = &state_g;
+  __shared__ __align__(16) string_offset_scan_state states[warps_per_block];
+  __shared__ __align__(128) uint32_t buffers[warps_per_block][string_offset_prefetch_words + 1];
+  auto* const s = &states[warp_idx];
   if (!setup_local_page_info(s,
                              pp,
                              chunks,
                              min_row,
                              num_rows,
-                             mask_filter{STRINGS_MASK_NON_DELTA_NON_DICT},
-                             page_processing_stage::STRING_BOUNDS)) {
+                             mask_filter{string_mask},
+                             page_processing_stage::STRING_BOUNDS,
+                             warp)) {
+    return;
+  }
+  if (s->setup.error != 0) {
+    if (warp.thread_rank() == 0) { set_error(s->setup.error, error_code); }
     return;
   }
 
-  // Determine if this is a list column and how many values to process
-  // We don't know how many values we'll need to read, because we don't know
-  // how many nulls we'll skip. So we have to read through the skipped rows.
-  // This runs before we know skipped_leaf_values so can't skip for lists either.
-  bool const is_list                 = (chunk.max_level[level_type::REPETITION] != 0);
-  size_t const num_values_to_process = is_list ? pp->nesting[chunk.max_nesting_depth - 1].batch_size
-                                               : s->setup.num_rows + s->setup.first_row;
+  // Null counts for the requested range are not known yet. Scan from the beginning through the
+  // requested end; list pages include continuation values even when they start no new rows.
+  bool const is_list = chunk.max_level[level_type::REPETITION] != 0;
+  auto const count   = is_list ? pp->nesting[chunk.max_nesting_depth - 1].batch_size
+                               : s->setup.num_rows + s->setup.first_row;
+  if (count == 0) { return; }
 
-  if (num_values_to_process == 0) { return; }
-
-  uint32_t* const str_offsets =
-    chunk.column_string_offset_base + page_string_offset_indices[page_idx];
-
-  // If the average string length is small, all of the threads in the warp can iteratively prefetch
-  // blocks of data containing many string lengths into shared memory.
-  // However, if the average string length is large, we'll spend too much time copying raw string
-  // data we don't need: have a single thread read the string lengths sequentially.
-  constexpr int max_avg_string_length_for_buffer = prefetch_size / 16;  // for 1024 buffer, is 64
-  auto const avg_string_length = s->stream.dict_size / pp->num_input_values - sizeof(int32_t);
-
-  if (avg_string_length > max_avg_string_length_for_buffer) {
-    // Use sequential processing for large average string lengths
-    read_string_offsets_sequential<decode_block_size>(
-      s, num_values_to_process, str_offsets, error_code);
-  } else {
-    // Use buffered processing for typical string lengths
-    read_string_offsets_buffered<decode_block_size, prefetch_size>(
-      s, num_values_to_process, str_offsets, error_code);
+  // num_valids/num_nulls may describe a cropped range or an earlier chunked-read iteration.
+  // The index's persisted full-page character count is safe to use: remaining bytes are exactly
+  // four bytes per physical PLAIN value. Without that metadata, start with the logical count and
+  // let observed prefix density correct the estimate while scanning.
+  auto value_count = pp->num_input_values;
+  if (pp->has_value_info && pp->str_bytes_from_index >= 0 &&
+      pp->str_bytes_from_index <= s->stream.dict_size) {
+    auto const prefix_bytes = s->stream.dict_size - pp->str_bytes_from_index;
+    if (prefix_bytes % sizeof(int32_t) == 0) { value_count = prefix_bytes / sizeof(int32_t); }
   }
+  string_offset_scan_input const input{
+    s->stream.data_start,
+    s->stream.dict_size,
+    static_cast<uint32_t>(count),
+    chunk.column_string_offset_base + page_string_offset_indices[page_idx]};
+  read_string_offsets(warp, input, value_count, buffers[warp_idx], error_code);
 }
 
 /**
@@ -1389,20 +1161,18 @@ void preprocess_string_offsets(cudf::detail::hostdevice_span<PageInfo> pages,
 {
   if (pages.size() == 0) { return; }
 
-  constexpr int preprocess_block_size = cudf::detail::warp_size;
-  constexpr int prefetch_size         = 1024;
-
-  dim3 dim_block(preprocess_block_size, 1);
-  dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
-
-  preprocess_string_offsets_kernel<preprocess_block_size, prefetch_size>
-    <<<dim_grid, dim_block, 0, stream.get()>>>(pages.device_ptr(),
-                                               chunks,
-                                               page_string_offset_indices,
-                                               page_mask,
-                                               min_row,
-                                               num_rows,
-                                               error_code);
+  // Avoid grouping a launch that cannot fill even one four-warp block.
+  auto launch = [&]<int warps_per_block>() {
+    auto const blocks = cudf::util::div_rounding_up_safe(pages.size(), size_t{warps_per_block});
+    preprocess_string_offsets_kernel<warps_per_block>
+      <<<blocks, warps_per_block * cudf::detail::warp_size, 0, stream.get()>>>(
+        pages, chunks, page_string_offset_indices, page_mask, min_row, num_rows, error_code);
+  };
+  if (pages.size() < 4) {
+    launch.template operator()<1>();
+  } else {
+    launch.template operator()<4>();
+  }
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
