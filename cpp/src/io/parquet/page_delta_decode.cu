@@ -1400,28 +1400,20 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                                             : bytes_one;
       uint32_t const mb_shift = passes_per_mb - 1;
       uint8_t* out            = output.address(static_cast<int32_t>(position + lane));
-      // Every `steady_step` bytes of progress, lanes 0-15 move the lines `steady_step` ahead into
-      // L1 and lanes 16-31 the lines `2 * steady_step` ahead into L2, continuing the initial
-      // L2 burst of `prefetch_window` bytes.
+      // Every `steady_step` bytes of progress, lanes 0-15 move the lines `2 * steady_step` ahead
+      // into L2, continuing the initial L2 burst of `prefetch_window` bytes. (L1 prefetches showed
+      // no L1 hits on B200.)
       constexpr uint32_t steady_step = 16 * cache_line_bytes;
       uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
       static_assert(prefetch_window == 2 * steady_step);
-      if (auto const line = next_step + lane * cache_line_bytes; lane < 16 and line < page_end) {
-        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
-      }
       while (position + block_values <= value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
         auto const aligned = at & ~uintptr_t{word_bytes - 1};
         if (aligned + 2 * word_bytes > page_end) { break; }
         if (at >= next_step) {
-          auto const line = next_step + (lane < 16 ? steady_step + lane * cache_line_bytes
-                                                   : 2 * steady_step + (lane - 16) * cache_line_bytes);
-          if (line < page_end) {
-            if (lane < 16) {
-              asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
-            } else {
-              asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
-            }
+          auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
+          if (lane < 16 and line < page_end) {
+            asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
           }
           next_step += steady_step;
         }
