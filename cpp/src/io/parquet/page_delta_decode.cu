@@ -1570,7 +1570,12 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                 uint32_t const stop2   = ~static_cast<uint32_t>(window2) & 0x8080'8080u;
                 uint32_t len2;
                 uint64_t v2;
-                if (stop2 != 0) {
+                if ((window2 & 0x80u) == 0) {
+                  // A one-byte minimum delta
+                  len2 = 1;
+                  if (static_cast<uint32_t>(window2 >> byte_bits) != widths_w) { return; }
+                  v2 = window2 & 0x7fu;
+                } else if (stop2 != 0) {
                   // A minimum delta of at most four bytes, so the window holds the four widths.
                   len2 = static_cast<uint32_t>(__ffs(static_cast<int>(stop2))) / byte_bits;
                   if (static_cast<uint32_t>(window2 >> (byte_bits * len2)) != widths_w) { return; }
