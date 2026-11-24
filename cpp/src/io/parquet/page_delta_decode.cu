@@ -1219,8 +1219,8 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     }
   };
 
-  // Page data is also moved from L2 into L1 ahead of the read position, in bursts of eight lines.
-  constexpr uint32_t l1_window = 8 * cache_line_bytes;
+  // Page data is also moved from L2 into L1 ahead of the read position, in bursts of 16 lines.
+  constexpr uint32_t l1_window = 16 * cache_line_bytes;
   uintptr_t l1_prefetched      = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
   auto l1_prefetch             = [&](uintptr_t cursor) {
     if (cursor + l1_window > l1_prefetched) {
