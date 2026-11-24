@@ -858,6 +858,29 @@ struct rank_map_output {
     }
   }
 
+  [[nodiscard]] __device__ __forceinline__ uint32_t width() const
+  {
+    return Width != 0 ? Width : dtype_len;
+  }
+
+  [[nodiscard]] __device__ __forceinline__ uint8_t* address(int32_t row) const
+  {
+    return data_out + static_cast<int64_t>(row - first_row) * width();
+  }
+
+  /**
+   * @brief Stores this lane's values of two consecutive passes at `out` and 32 values later;
+   * returns the address 64 values past `out`.
+   */
+  __device__ __forceinline__ uint8_t* store_pair(uint8_t* out, uint64_t a, uint64_t b) const
+  {
+    // The output column is in global memory; this selects global stores.
+    __builtin_assume(__isGlobal(out));
+    store_value<Width>(out, dtype_len, a);
+    store_value<Width>(out + warp_lanes * width(), dtype_len, b);
+    return out + 2 * warp_lanes * width();
+  }
+
   __device__ __forceinline__ void store(int32_t row, uint64_t value) const
   {
     store_value<Width>(
@@ -986,6 +1009,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
   auto const mb_count      = static_cast<uint32_t>(mini_block_count);
   auto const passes_per_mb = static_cast<uint32_t>((block_size / mini_block_count) / warp_lanes);
   auto const block_passes  = static_cast<uint32_t>(block_size / warp_lanes);
+  auto const block_values  = static_cast<uint32_t>(block_size);
   // Bytes of packed data in a mini-block per bit of width
   uint32_t const mb_bytes_per_bit = passes_per_mb * pass_bytes_per_bit;
   uint32_t const value_limit = cuda::std::min(nz_count, static_cast<uint32_t>(value_count));
@@ -1009,24 +1033,18 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     prefetched += prefetch_window;
   };
 
-  // Aligned words covering the header of the block at `staged_at`, loaded one block ahead
-  uint64_t staged[header_words];
-  uint8_t const* staged_at = nullptr;
-  auto stage               = [&](uint8_t const* at) {
-    staged_at          = at;
-    auto const aligned = aligned_word(at);
-#pragma unroll
-    for (uint32_t i = 0; i < header_words; ++i) {
-      auto const word = aligned + word_bytes * i;
-      staged[i]       = word < page_end ? *reinterpret_cast<uint64_t const*>(word) : 0;
+  // Starts moving the first two lines of the block at `at` (its header and the start of its packed
+  // values) into L1 one block ahead.
+  auto stage = [&](uint8_t const* at) {
+    if (lane < 2) {
+      auto const line = (reinterpret_cast<uintptr_t>(at) & ~uintptr_t{cache_line_bytes - 1}) +
+                        lane * cache_line_bytes;
+      if (line < page_end) { asm volatile("prefetch.global.L1 [%0];" ::"l"(line)); }
     }
   };
 
   bool error = false;
-  if (position < value_limit) {
-    prefetch_burst();
-    stage(p);
-  }
+  if (position < value_limit) { prefetch_burst(); }
   while (position < value_limit) {
     // Parse the header of the block at `p`.
     uint64_t min_delta_bits = 0;
@@ -1035,18 +1053,25 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     uint8_t const* mb_start = nullptr;
     bool packed             = false;
     {
-      bool const from_staged = staged_at == p;
+      bool const from_staged = p < end;
       uint32_t len           = 0;
       uint64_t lo            = 0;
       uint64_t hi            = 0;
       if (from_staged) {
         auto const aligned = aligned_word(p);
+        auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
         uint64_t w[header_words];
-        bool const near_end = aligned + word_bytes * header_words > page_end;
+        if (aligned + word_bytes * header_words <= page_end) {
 #pragma unroll
-        for (uint32_t i = 0; i < header_words; ++i) {
-          w[i] = near_end ? clear_past_end(staged[i], aligned + word_bytes * i, page_end)
-                          : staged[i];
+          for (uint32_t i = 0; i < header_words; ++i) {
+            w[i] = __ldg(src + i);
+          }
+        } else {
+#pragma unroll
+          for (uint32_t i = 0; i < header_words; ++i) {
+            auto const word = aligned + word_bytes * i;
+            w[i] = word < page_end ? clear_past_end(__ldg(src + i), word, page_end) : 0;
+          }
         }
         // The `header_bytes` bytes starting at p; bytes past the end of the page read as zero,
         // like the bounded byte loads of the fallback.
@@ -1105,25 +1130,31 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     // Locate the following block and start loading its header when more values follow.
     uint8_t const* next_block = nullptr;
     uint32_t width_sum        = 0;
-    uint32_t width_max        = 0;
+    // Whether every packed width is at most the fast path's limit: a byte above `limit` either has
+    // its top bit set or sets it when `127 - limit` is added to its low seven bits, without carrying
+    // into the next byte.
+    bool widths_fit = false;
     if (packed) {
-      // Byte-wise sums and maxima of the packed widths
-      auto const widths_lo = static_cast<uint32_t>(packed_widths);
-      auto const widths_hi = static_cast<uint32_t>(packed_widths >> 32);
-      width_sum            = __dp4a(widths_hi, 0x0101'0101u, __dp4a(widths_lo, 0x0101'0101u, 0u));
-      width_max            = __vmaxu4(widths_lo, widths_hi);
-      width_max            = __vmaxu4(width_max, width_max >> 16);
-      width_max            = __vmaxu4(width_max, width_max >> 8) & 0xffu;
+      // Byte-wise sum of the packed widths
+      width_sum = __dp4a(static_cast<uint32_t>(packed_widths >> 32),
+                         0x0101'0101u,
+                         __dp4a(static_cast<uint32_t>(packed_widths), 0x0101'0101u, 0u));
+      constexpr uint64_t bytes_one  = 0x0101'0101'0101'0101ull;
+      constexpr uint64_t limit      = wide ? max_split_width : word_bits;
+      constexpr uint64_t top_bits   = bytes_one * 0x80;
+      uint64_t const over =
+        (packed_widths | ((packed_widths & ~top_bits) + bytes_one * (127 - limit))) & top_bits;
+      widths_fit = over == 0;
     }
-    bool const whole_block = position + block_size <= value_limit;
-    if (position + block_size < value_limit) {
+    bool const whole_block = position + block_values <= value_limit;
+    if (position + block_values < value_limit) {
       if (not packed) {
         for (uint32_t m = 0; m < mb_count; ++m) {
           width_sum += width_of(m);
         }
       }
       next_block = mb_start + static_cast<size_t>(mb_bytes_per_bit) * width_sum;
-      if (next_block >= mb_start && next_block < end) { stage(next_block); }
+      if (next_block >= mb_start) { stage(next_block); }
     }
     if (reinterpret_cast<uintptr_t>(mb_start) + prefetch_window / 2 > prefetched &&
         prefetched < page_end) {
@@ -1138,13 +1169,14 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     // A whole block of 32- or 64-value mini-blocks whose packed values all lie within the page is
     // decoded two passes at a time with no per-pass checks: the two halves of one 64-value
     // mini-block, or two 32-value mini-blocks.
-    if (packed and whole_block and passes_per_mb <= 2 and block_passes % 2 == 0 and
-        width_max <= (wide ? max_split_width : word_bits) and
+    if (packed and whole_block and widths_fit and passes_per_mb <= 2 and block_passes % 2 == 0 and
+        (Mapped or static_cast<int32_t>(position) >= output.first_row) and
         reinterpret_cast<uintptr_t>(mb_start) + static_cast<size_t>(mb_bytes_per_bit) * width_sum <=
           page_end) {
       uint32_t const mb_shift = passes_per_mb - 1;
-      bool const direct       = not Mapped and static_cast<int32_t>(position) >= output.first_row;
       uint8_t const* q        = mb_start;
+      // Output of this lane's value in the block's first pass, when not `Mapped`
+      [[maybe_unused]] uint8_t* out = output.address(static_cast<int32_t>(position + lane));
       for (uint32_t k = 0; k < block_passes; k += 2) {
         auto const wa =
           static_cast<uint32_t>(packed_widths >> (byte_bits * (k >> mb_shift))) & 0xffu;
@@ -1169,13 +1201,11 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         acc_t vb;
         sum_pair<acc_t>(
           xa, xb, cuda::std::max(wa, wb), lane_min_delta, pass_min_delta, carry, va, vb);
-        if (direct) {
-          output.store(static_cast<int32_t>(position + lane), static_cast<uint64_t>(va));
-          output.store(static_cast<int32_t>(position + warp_lanes + lane),
-                       static_cast<uint64_t>(vb));
-        } else {
+        if constexpr (Mapped) {
           output.place(static_cast<uint64_t>(va), position, row_a, value_limit);
           output.place(static_cast<uint64_t>(vb), position + warp_lanes, row_b, value_limit);
+        } else {
+          out = output.store_pair(out, static_cast<uint64_t>(va), static_cast<uint64_t>(vb));
         }
         position += 2 * warp_lanes;
       }
