@@ -1545,6 +1545,14 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                 cuda::std::max(1u, (warp_lanes * 32) / (block_bytes + 8));
               uint32_t touch_countdown = 1;
               while (true) {
+                // Start loading the next header before decoding this block.
+                auto const at2         = reinterpret_cast<uintptr_t>(block_next);
+                auto const aligned2    = at2 & ~uintptr_t{word_bytes - 1};
+                auto const* const src2 = reinterpret_cast<unsigned long long const*>(aligned2);
+                bool const has_header  = aligned2 + 3 * word_bytes <= page_end;
+                uint64_t const w20     = has_header ? __ldg(src2) : 0;
+                uint64_t const w21     = has_header ? __ldg(src2 + 1) : 0;
+                uint64_t const w22     = has_header ? __ldg(src2 + 2) : 0;
                 decode_uniform_block64<W, acc_t>(block_q,
                                                  lane,
                                                  block_lane_min_delta,
@@ -1552,10 +1560,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                                                  carry,
                                                  place_values);
                 p = block_next;
-                if (position + block_values > value_limit) { return; }
-                auto const at2      = reinterpret_cast<uintptr_t>(p);
-                auto const aligned2 = at2 & ~uintptr_t{word_bytes - 1};
-                if (aligned2 + 2 * word_bytes > page_end) { return; }
+                if (position + block_values > value_limit or not has_header) { return; }
                 if (at2 >= next_step) {
                   auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
                   if (lane < 16 and line < page_end) {
@@ -1563,10 +1568,8 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                   }
                   next_step += steady_step;
                 }
-                auto const* const src2 = reinterpret_cast<unsigned long long const*>(aligned2);
                 auto const shift2      = static_cast<uint32_t>(at2 - aligned2) * byte_bits;
-                uint64_t const w21     = __ldg(src2 + 1);
-                uint64_t const window2 = extract64(__ldg(src2), w21, shift2);
+                uint64_t const window2 = extract64(w20, w21, shift2);
                 uint32_t const stop2   = ~static_cast<uint32_t>(window2) & 0x8080'8080u;
                 uint32_t len2;
                 uint64_t v2;
@@ -1580,8 +1583,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                        ((x2 >> 3) & 0xfe0'0000u);
                 } else {
                   // A longer minimum delta, from 16 bytes of header
-                  if (aligned2 + 3 * word_bytes > page_end) { return; }
-                  uint64_t const hi2 = extract64(w21, __ldg(src2 + 2), shift2);
+                  uint64_t const hi2 = extract64(w21, w22, shift2);
                   constexpr uint64_t continuation_bits = 0x8080'8080'8080'8080ull;
                   uint64_t const stop_lo               = ~window2 & continuation_bits;
                   uint64_t const stop_hi               = ~hi2 & continuation_bits;
