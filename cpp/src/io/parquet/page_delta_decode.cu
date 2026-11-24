@@ -1041,7 +1041,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
           prefetched < page_end) {
         prefetch_burst();
       }
-      uint32_t const count = cuda::std::min(group_passes, block_needed - done);
+      uint32_t const count = cuda::std::min(uint32_t{group_passes}, block_needed - done);
       // Warp-uniform pass descriptors
       uint32_t pass_width[group_passes];
       uint8_t const* pass_data[group_passes];
