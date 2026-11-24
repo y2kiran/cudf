@@ -1082,6 +1082,110 @@ __device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
   }
 }
 
+/**
+ * @brief Decodes a block of four 64-value mini-blocks of compile-time width `W` (at most
+ * `max_running_width`) with eight consecutive values per lane, and stores it at `out`, the output
+ * of the block's first value.
+ *
+ * Lane `i` holds values 8i to 8i + 7, which lie in one mini-block and occupy one run of 8W bits,
+ * so the lane loads a few words and unpacks its values at compile-time offsets. One warp scan of
+ * the lanes' sums gives each lane's start; the lane then accumulates its eight values and stores
+ * them contiguously, in 16-byte stores when `out` allows it.
+ */
+template <uint32_t W, uint32_t Width, typename acc_t>
+__device__ __forceinline__ void decode_blocked_uniform(
+  uint8_t const* q, uint32_t lane, acc_t min_delta, acc_t& carry, uint8_t* out)
+{
+  constexpr uint32_t items = 8;
+  constexpr uint32_t span  = items * W;
+  uint32_t x[items];
+  if constexpr (W == 0) {
+#pragma unroll
+    for (uint32_t j = 0; j < items; ++j) {
+      x[j] = 0;
+    }
+  } else {
+    constexpr uint32_t aligned_words = (span + 31) / 32;
+    constexpr uint32_t mask          = W < 32 ? (1u << W) - 1 : ~0u;
+    auto const addr                  = reinterpret_cast<uintptr_t>(q);
+    uint32_t const bit = static_cast<uint32_t>(addr % 4) * byte_bits + lane * span;
+    auto const* const w = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
+    uint32_t const shift = bit % 32;
+    // Only the words holding bits of this lane's values are loaded.
+    uint32_t raw[aligned_words + 1];
+#pragma unroll
+    for (uint32_t k = 0; k <= aligned_words; ++k) {
+      raw[k] = k * 32 < shift + span ? __ldg(w + k) : 0u;
+    }
+    uint32_t a[aligned_words + 1];
+#pragma unroll
+    for (uint32_t k = 0; k < aligned_words; ++k) {
+      a[k] = __funnelshift_r(raw[k], raw[k + 1], shift);
+    }
+    a[aligned_words] = 0;
+#pragma unroll
+    for (uint32_t j = 0; j < items; ++j) {
+      uint32_t const pos = j * W;
+      uint32_t const idx = pos / 32;
+      uint32_t const sh  = pos % 32;
+      x[j] = (sh + W <= 32 ? a[idx] >> sh : __funnelshift_r(a[idx], a[idx + 1], sh)) & mask;
+    }
+  }
+  uint32_t sum = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < items; ++j) {
+    sum += x[j];
+  }
+  // The block's normalized sum is below 2^32 (256 * (2^24 - 1) < 2^32).
+  uint32_t const inclusive = inclusive_sum32(sum);
+  uint32_t const total     = __shfl_sync(0xffff'ffffu, inclusive, warp_lanes - 1);
+  acc_t value = carry + static_cast<acc_t>(inclusive - sum) +
+                static_cast<acc_t>(items * lane) * min_delta;
+  acc_t values[items];
+#pragma unroll
+  for (uint32_t j = 0; j < items; ++j) {
+    value += min_delta + static_cast<acc_t>(x[j]);
+    values[j] = value;
+  }
+  carry += static_cast<acc_t>(total) + static_cast<acc_t>(items * warp_lanes) * min_delta;
+
+  auto* const dst = out + lane * items * Width;
+  // The output column is in global memory; this selects global stores.
+  __builtin_assume(__isGlobal(dst));
+  bool const aligned = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
+  if constexpr (Width == 8) {
+    if (aligned) {
+#pragma unroll
+      for (uint32_t k = 0; k < items / 2; ++k) {
+        __stcs(reinterpret_cast<longlong2*>(dst) + k,
+               make_longlong2(static_cast<long long>(values[2 * k]),
+                              static_cast<long long>(values[2 * k + 1])));
+      }
+    } else {
+#pragma unroll
+      for (uint32_t j = 0; j < items; ++j) {
+        __stcs(reinterpret_cast<long long*>(dst) + j, static_cast<long long>(values[j]));
+      }
+    }
+  } else {
+    if (aligned) {
+#pragma unroll
+      for (uint32_t k = 0; k < items / 4; ++k) {
+        __stcs(reinterpret_cast<int4*>(dst) + k,
+               make_int4(static_cast<int>(values[4 * k]),
+                         static_cast<int>(values[4 * k + 1]),
+                         static_cast<int>(values[4 * k + 2]),
+                         static_cast<int>(values[4 * k + 3])));
+      }
+    } else {
+#pragma unroll
+      for (uint32_t j = 0; j < items; ++j) {
+        __stcs(reinterpret_cast<int*>(dst) + j, static_cast<int>(values[j]));
+      }
+    }
+  }
+}
+
 #define CUDF_NZ_DELTA_WIDTH_CASE(n) \
   case n: f.template operator()<n>(); break;
 
@@ -1541,16 +1645,29 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
               uint8_t const* block_next      = next;
               acc_t block_lane_min_delta     = lane_min_delta;
               acc_t block_pass_min_delta     = pass_min_delta;
+              acc_t block_min_delta          = min_delta;
               constexpr uint32_t touch_blocks =
                 cuda::std::max(1u, (warp_lanes * 32) / (block_bytes + 8));
               uint32_t touch_countdown = 1;
               while (true) {
-                decode_uniform_block64<W, acc_t>(block_q,
-                                                 lane,
-                                                 block_lane_min_delta,
-                                                 block_pass_min_delta,
-                                                 carry,
-                                                 place_values);
+                if constexpr (W <= max_running_width) {
+                  // Eight consecutive values per lane
+                  decode_blocked_uniform<W, Width, acc_t>(
+                    block_q,
+                    lane,
+                    block_min_delta,
+                    carry,
+                    output.address(static_cast<int32_t>(position)));
+                  out += block_values * Width;
+                  position += block_values;
+                } else {
+                  decode_uniform_block64<W, acc_t>(block_q,
+                                                   lane,
+                                                   block_lane_min_delta,
+                                                   block_pass_min_delta,
+                                                   carry,
+                                                   place_values);
+                }
                 p = block_next;
                 if (position + block_values > value_limit) { return; }
                 auto const at2      = reinterpret_cast<uintptr_t>(p);
@@ -1625,6 +1742,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                   }
                 }
                 auto const min_delta2 = static_cast<acc_t>(zigzag_decode(v2));
+                block_min_delta       = min_delta2;
                 block_lane_min_delta  = static_cast<acc_t>(lane + 1) * min_delta2;
                 block_pass_min_delta  = static_cast<acc_t>(warp_lanes) * min_delta2;
               }
