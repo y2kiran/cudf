@@ -40,9 +40,9 @@ constexpr int delta_nz_buf_size = 4 * delta_max_batch_size;
 constexpr int32_t decode_delta_binary_with_nz_map_pages_per_block = 2;
 constexpr int32_t decode_delta_binary_with_nz_map_block_size =
   decode_delta_binary_with_nz_map_pages_per_block * cudf::detail::warp_size;
-// Resident blocks per SM the register budget must allow: 40 page warps
+// Resident blocks per SM the register budget must allow: 36 page warps
 constexpr int32_t decode_delta_binary_with_nz_map_min_blocks =
-  40 / decode_delta_binary_with_nz_map_pages_per_block;
+  36 / decode_delta_binary_with_nz_map_pages_per_block;
 
 // DELTA_BYTE_ARRAY encoding (incremental encoding or front compression), is used for BYTE_ARRAY
 // columns. For each element in a sequence of strings, a prefix length from the preceding string
@@ -2090,7 +2090,7 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
 // Decodes flat DELTA_BINARY_PACKED pages, like `decode_delta_binary_kernel`, but places values
 // using the nz map's rank map instead of decoding definition levels itself. One warp decodes each
 // page, several pages per block, with no block-wide synchronization. The launch bounds cap
-// registers so that 40 page warps stay resident per SM.
+// registers so that 36 page warps stay resident per SM.
 CUDF_KERNEL void __launch_bounds__(decode_delta_binary_with_nz_map_block_size,
                                     decode_delta_binary_with_nz_map_min_blocks)
   decode_delta_binary_kernel_with_nz_map(PageInfo* pages,
