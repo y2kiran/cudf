@@ -1435,7 +1435,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       __shared__ uint32_t touch_sink[warp_lanes];
       auto const sink = static_cast<uint32_t>(__cvta_generic_to_shared(touch_sink + lane));
       uint32_t touched = 0;
-      while (position + block_values <= value_limit) {
+      while (position < value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
         auto const aligned = at & ~uintptr_t{word_bytes - 1};
         if (aligned + 2 * word_bytes > page_end) { break; }
@@ -1488,6 +1488,67 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                              : hi >> (byte_bits * (len - word_bytes)));
         }
         widths &= mb_count < 4 ? (1u << (byte_bits * mb_count)) - 1 : ~0u;
+        if (position + block_values > value_limit) {
+          // The page's last, partial block: only the mini-blocks holding values have packed
+          // data, and stores are masked at `value_limit`.
+          uint32_t const values_per_mb = passes_per_mb * warp_lanes;
+          uint32_t const needed_mbs    = (value_limit - position + values_per_mb - 1) / values_per_mb;
+          uint32_t const needed = widths & (needed_mbs < 4 ? (1u << (byte_bits * needed_mbs)) - 1 : ~0u);
+          bool const needed_fit = ((needed | ((needed & ~top_bits) + bytes_one * (127 - limit))) &
+                                   top_bits) == 0;
+          auto const* tail_q = p + len + mb_count;
+          if (not needed_fit or reinterpret_cast<uintptr_t>(tail_q) +
+                                    mb_bytes_per_bit * __dp4a(needed, bytes_one, 0u) >
+                                  page_end) {
+            break;
+          }
+          auto const tail_min_delta = static_cast<acc_t>(zigzag_decode(v));
+          acc_t const tail_lane     = static_cast<acc_t>(lane + 1) * tail_min_delta;
+          acc_t const tail_pass     = static_cast<acc_t>(warp_lanes) * tail_min_delta;
+          auto place_tail           = [&](acc_t va, acc_t vb) {
+            output.place(static_cast<uint64_t>(va),
+                         position,
+                         static_cast<int32_t>(position + lane),
+                         value_limit);
+            output.place(static_cast<uint64_t>(vb),
+                         position + warp_lanes,
+                         static_cast<int32_t>(position + warp_lanes + lane),
+                         value_limit);
+            position += 2 * warp_lanes;
+          };
+          if (mb_shift != 0) {
+            for (uint32_t m = 0; m < needed_mbs; ++m) {
+              uint32_t const w = (needed >> (byte_bits * m)) & 0xffu;
+              uint32_t xa      = 0;
+              uint32_t xb      = 0;
+              if (w != 0) {
+                lane_bits const bits{tail_q, w, lane};
+                xa = bits.get(0);
+                xb = bits.get(warp_lanes * w);
+              }
+              tail_q += 2 * w * pass_bytes_per_bit;
+              acc_t va;
+              acc_t vb;
+              sum_pair<acc_t>(xa, xb, w, tail_lane, tail_pass, carry, va, vb);
+              place_tail(va, vb);
+            }
+          } else {
+            for (uint32_t m = 0; m < needed_mbs; m += 2) {
+              uint32_t const wa = (needed >> (byte_bits * m)) & 0xffu;
+              uint32_t const wb = (needed >> (byte_bits * (m + 1))) & 0xffu;
+              uint32_t xa       = wa != 0 ? lane_bits{tail_q, wa, lane}.get(0) : 0u;
+              uint32_t xb       = 0;
+              if (wb != 0) { xb = lane_bits{tail_q + wa * pass_bytes_per_bit, wb, lane}.get(0); }
+              tail_q += (wa + wb) * pass_bytes_per_bit;
+              acc_t va;
+              acc_t vb;
+              sum_pair<acc_t>(xa, xb, cuda::std::max(wa, wb), tail_lane, tail_pass, carry, va, vb);
+              place_tail(va, vb);
+            }
+          }
+          position = value_limit;
+          break;
+        }
         uint32_t const width_sum = __dp4a(widths, bytes_one, 0u);
         // A byte above `limit` has its top bit set, or sets it when `127 - limit` is added to its
         // low seven bits, without carrying into the next byte.
