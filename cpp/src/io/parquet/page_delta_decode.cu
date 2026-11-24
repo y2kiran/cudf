@@ -1084,6 +1084,10 @@ __device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
   }
 }
 
+// Shared staging for `decode_blocked_uniform`'s transpose, one block of 64-bit values; declared
+// once so the width instantiations share it
+__shared__ __align__(16) uint64_t blocked_transpose[256];
+
 /**
  * @brief Decodes a block of four 64-value mini-blocks of compile-time width `W` (at most
  * `max_running_width`) with eight consecutive values per lane, and stores it at `out`, the output
@@ -1153,7 +1157,7 @@ __device__ __forceinline__ void decode_blocked_uniform(
 
   // Transpose through shared memory so the stores stay lane-striped and contiguous: value g of the
   // block is staged at slot g ^ ((g >> 3) & 7), which spreads each store phase over the banks.
-  __shared__ acc_t staged[items * warp_lanes];
+  auto* const staged = reinterpret_cast<acc_t*>(blocked_transpose);
 #pragma unroll
   for (uint32_t j = 0; j < items; ++j) {
     staged[items * lane + (j ^ (lane & 7))] = values[j];
