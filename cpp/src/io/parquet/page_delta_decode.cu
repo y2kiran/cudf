@@ -1409,10 +1409,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       if (auto const line = next_step + lane * cache_line_bytes; lane < 16 and line < page_end) {
         asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
       }
-      // The two aligned words starting the next block's header, loaded while this block decodes
-      uintptr_t header_at = 0;
-      uint64_t header_lo  = 0;
-      uint64_t header_hi  = 0;
       while (position + block_values <= value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
         auto const aligned = at & ~uintptr_t{word_bytes - 1};
@@ -1431,9 +1427,8 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
         auto const shift      = static_cast<uint32_t>(at - aligned) * byte_bits;
-        bool const staged     = header_at == at;
-        uint64_t const w1     = staged ? header_hi : __ldg(src + 1);
-        uint64_t const window = extract64(staged ? header_lo : __ldg(src), w1, shift);
+        uint64_t const w1     = __ldg(src + 1);
+        uint64_t const window = extract64(__ldg(src), w1, shift);
         uint32_t const stop   = ~static_cast<uint32_t>(window) & 0x8080'8080u;
         uint32_t len;
         uint64_t v;
@@ -1480,14 +1475,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         auto const* q          = p + len + mb_count;
         auto const* const next = q + mb_bytes_per_bit * width_sum;
         if (not widths_fit or reinterpret_cast<uintptr_t>(next) > page_end) { break; }
-        // Start loading the following header.
-        if (auto const next_aligned = reinterpret_cast<uintptr_t>(next) & ~uintptr_t{word_bytes - 1};
-            next_aligned + 2 * word_bytes <= page_end) {
-          auto const* const next_src = reinterpret_cast<unsigned long long const*>(next_aligned);
-          header_at                  = reinterpret_cast<uintptr_t>(next);
-          header_lo                  = __ldg(next_src);
-          header_hi                  = __ldg(next_src + 1);
-        }
 
         auto const min_delta       = static_cast<acc_t>(zigzag_decode(v));
         acc_t const lane_min_delta = static_cast<acc_t>(lane + 1) * min_delta;
