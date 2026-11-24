@@ -597,6 +597,8 @@ static_assert(prefetch_window % (cache_line_bytes * warp_lanes) == 0,
 // The 32 normalized deltas of a pass at this width or below sum below 2^16 (32 * 2047 < 65536), so
 // two passes share one 32-bit scan
 constexpr uint32_t max_paired_width = 11;
+// Up to this width the 256 normalized deltas of a block sum below 2^32 (256 * (2^24 - 1) < 2^32)
+constexpr uint32_t max_running_width = 24;
 // The 32 normalized deltas of a pass at this width or below sum below 2^10 (32 * 31 < 1024), so
 // three passes share one 32-bit scan
 constexpr uint32_t max_tripled_width = 5;
