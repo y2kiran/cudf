@@ -1422,7 +1422,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             };
             // Packed bytes of one 64-value mini-block
             constexpr uint32_t mb_bytes = 2 * W * pass_bytes_per_bit;
-            uint32_t m                  = 0;
+            if (mb_count == 4) {
+              // The usual geometry: the whole block in one call
+              decode_uniform_block64<W, acc_t>(
+                q, lane, lane_min_delta, pass_min_delta, carry, place_values);
+              return;
+            }
+            uint32_t m = 0;
             for (; m + 4 <= mb_count; m += 4) {
               decode_uniform_block64<W, acc_t>(
                 q, lane, lane_min_delta, pass_min_delta, carry, place_values);
