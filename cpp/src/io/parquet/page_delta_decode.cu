@@ -836,6 +836,49 @@ __device__ __forceinline__ void unpack_mini_block64(uint8_t const* q,
 }
 
 /**
+ * @brief Reconstructs eight consecutive 64-bit passes from their normalized deltas `x`, each at
+ * most `max_split_width` bits wide, and advances `carry` past them; `place` receives the passes in
+ * pairs. The high bits (< 8) of four passes share one scan of 8-bit fields (32 * 7 < 256); see
+ * `sum_pair`.
+ */
+template <typename acc_t, typename Place>
+__device__ __forceinline__ void sum_split8(uint32_t const (&x)[8],
+                                           acc_t lane_min_delta,
+                                           acc_t pass_min_delta,
+                                           acc_t& carry,
+                                           Place&& place)
+{
+  constexpr uint32_t passes = 8;
+  constexpr uint32_t group  = 4;
+  uint32_t high_sums[passes / group];
+  uint32_t high_all[passes / group];
+#pragma unroll
+  for (uint32_t g = 0; g < passes / group; ++g) {
+    uint32_t highs = 0;
+#pragma unroll
+    for (uint32_t j = 0; j < group; ++j) {
+      highs |= (x[g * group + j] >> max_narrow_width) << (byte_bits * j);
+    }
+    high_sums[g] = inclusive_sum32(highs);
+    high_all[g]  = __shfl_sync(0xffff'ffffu, high_sums[g], warp_lanes - 1);
+  }
+  auto widen = [](uint32_t sum, uint32_t high) {
+    return static_cast<acc_t>(static_cast<uint64_t>(sum - (high << max_narrow_width)) +
+                              (static_cast<uint64_t>(high) << max_narrow_width));
+  };
+  acc_t v[passes];
+#pragma unroll
+  for (uint32_t k = 0; k < passes; ++k) {
+    uint32_t const sums  = inclusive_sum32(x[k]);
+    uint32_t const all   = __shfl_sync(0xffff'ffffu, sums, warp_lanes - 1);
+    uint32_t const field = byte_bits * (k % group);
+    v[k]                 = carry + lane_min_delta + widen(sums, (high_sums[k / group] >> field) & 0xffu);
+    carry += widen(all, (high_all[k / group] >> field) & 0xffu) + pass_min_delta;
+    if (k % 2 == 1) { place(v[k - 1], v[k]); }
+  }
+}
+
+/**
  * @brief Decodes a block of four 64-value mini-blocks that all have the compile-time width `W`.
  *
  * Every pass starts a whole number of words after the first, at the same bit offset, so the lane
@@ -877,35 +920,7 @@ __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
     }
   }
   if constexpr (sizeof(acc_t) == sizeof(uint64_t) and W > max_narrow_width) {
-    // The high bits (< 8) of four passes share one scan of 8-bit fields (32 * 7 < 256); see
-    // `sum_pair`.
-    constexpr uint32_t group = 4;
-    uint32_t high_sums[passes / group];
-    uint32_t high_all[passes / group];
-#pragma unroll
-    for (uint32_t g = 0; g < passes / group; ++g) {
-      uint32_t highs = 0;
-#pragma unroll
-      for (uint32_t j = 0; j < group; ++j) {
-        highs |= (x[g * group + j] >> max_narrow_width) << (byte_bits * j);
-      }
-      high_sums[g] = inclusive_sum32(highs);
-      high_all[g]  = __shfl_sync(0xffff'ffffu, high_sums[g], warp_lanes - 1);
-    }
-    auto widen = [](uint32_t sum, uint32_t high) {
-      return static_cast<acc_t>(static_cast<uint64_t>(sum - (high << max_narrow_width)) +
-                                (static_cast<uint64_t>(high) << max_narrow_width));
-    };
-    acc_t v[passes];
-#pragma unroll
-    for (uint32_t k = 0; k < passes; ++k) {
-      uint32_t const sums  = inclusive_sum32(x[k]);
-      uint32_t const all   = __shfl_sync(0xffff'ffffu, sums, warp_lanes - 1);
-      uint32_t const field = byte_bits * (k % group);
-      v[k]                 = carry + lane_min_delta + widen(sums, (high_sums[k / group] >> field) & 0xffu);
-      carry += widen(all, (high_all[k / group] >> field) & 0xffu) + pass_min_delta;
-      if (k % 2 == 1) { place(v[k - 1], v[k]); }
-    }
+    sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
   } else {
 #pragma unroll
     for (uint32_t m = 0; m < passes / 2; ++m) {
@@ -957,6 +972,22 @@ __device__ __forceinline__ void decode_mixed_block64(uint8_t const* q,
     // The next mini-block starts 64 * w bits later.
     bit += 2 * warp_lanes * w;
   }
+  if constexpr (sizeof(acc_t) == sizeof(uint64_t)) {
+    uint32_t max_width = 0;
+#pragma unroll
+    for (uint32_t m = 0; m < mini_blocks; ++m) {
+      max_width = cuda::std::max(max_width, (widths >> (byte_bits * m)) & 0xffu);
+    }
+    if (max_width > max_narrow_width) {
+      uint32_t x[2 * mini_blocks];
+#pragma unroll
+      for (uint32_t k = 0; k < 2 * mini_blocks; ++k) {
+        x[k] = __funnelshift_r(lo[k], hi[k], shift[k / 2]) & mask[k / 2];
+      }
+      sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
+      return;
+    }
+  }
 #pragma unroll
   for (uint32_t m = 0; m < mini_blocks; ++m) {
     uint32_t const xa = __funnelshift_r(lo[2 * m], hi[2 * m], shift[m]) & mask[m];
@@ -966,6 +997,59 @@ __device__ __forceinline__ void decode_mixed_block64(uint8_t const* q,
     sum_pair<acc_t>(xa,
                     xb,
                     (widths >> (byte_bits * m)) & 0xffu,
+                    lane_min_delta,
+                    pass_min_delta,
+                    carry,
+                    va,
+                    vb);
+    place(va, vb);
+  }
+}
+
+/**
+ * @brief Decodes a block of four 32-value mini-blocks with runtime widths `widths` (one byte each)
+ * packed from `q`, issuing all of the lane's payload loads before unpacking and scanning. Pairs of
+ * mini-blocks share a scan when both are narrow enough.
+ */
+template <typename acc_t, typename Place>
+__device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
+                                                     uint32_t widths,
+                                                     uint32_t lane,
+                                                     acc_t lane_min_delta,
+                                                     acc_t pass_min_delta,
+                                                     acc_t& carry,
+                                                     Place&& place)
+{
+  constexpr uint32_t mini_blocks = 4;
+  uint32_t lo[mini_blocks];
+  uint32_t hi[mini_blocks];
+  uint32_t shift[mini_blocks];
+  uint32_t mask[mini_blocks];
+  auto const addr = reinterpret_cast<uintptr_t>(q);
+  uint32_t bit    = static_cast<uint32_t>(addr % 4) * byte_bits;
+  auto const* const base = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3});
+#pragma unroll
+  for (uint32_t m = 0; m < mini_blocks; ++m) {
+    uint32_t const w      = (widths >> (byte_bits * m)) & 0xffu;
+    uint32_t const at     = bit + lane * w;
+    auto const* const ptr = base + at / 32;
+    shift[m]              = at % 32;
+    mask[m]               = w < 32 ? (1u << w) - 1 : ~0u;
+    lo[m]                 = w != 0 ? __ldg(ptr) : 0u;
+    hi[m]                 = shift[m] + w > 32 ? __ldg(ptr + 1) : 0u;
+    // The next mini-block starts 32 * w bits later.
+    bit += warp_lanes * w;
+  }
+#pragma unroll
+  for (uint32_t m = 0; m < mini_blocks; m += 2) {
+    uint32_t const xa = __funnelshift_r(lo[m], hi[m], shift[m]) & mask[m];
+    uint32_t const xb = __funnelshift_r(lo[m + 1], hi[m + 1], shift[m + 1]) & mask[m + 1];
+    acc_t va;
+    acc_t vb;
+    sum_pair<acc_t>(xa,
+                    xb,
+                    cuda::std::max((widths >> (byte_bits * m)) & 0xffu,
+                                   (widths >> (byte_bits * (m + 1))) & 0xffu),
                     lane_min_delta,
                     pass_min_delta,
                     carry,
@@ -1413,10 +1497,15 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             continue;
           }
         }
-        if (mb_shift != 0 and mb_count == 4) {
-          // Mixed widths: one runtime-width body with all payload loads up front
-          decode_mixed_block64<acc_t>(
-            q, widths, lane, lane_min_delta, pass_min_delta, carry, place_values);
+        if (mb_count == 4) {
+          // One runtime-width body with all payload loads up front
+          if (mb_shift != 0) {
+            decode_mixed_block64<acc_t>(
+              q, widths, lane, lane_min_delta, pass_min_delta, carry, place_values);
+          } else {
+            decode_mixed_block32<acc_t>(
+              q, widths, lane, lane_min_delta, pass_min_delta, carry, place_values);
+          }
           p = next;
           continue;
         }
