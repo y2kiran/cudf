@@ -646,29 +646,6 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
   return w;
 }
 
-// Bytes of page data each warp stages in shared memory per block, in 16-byte chunks
-constexpr uint32_t stage_bytes  = 1'024;
-constexpr uint32_t stage_chunk  = 16;
-constexpr uint32_t stage_words  = stage_bytes / sizeof(uint32_t);
-constexpr uint32_t stage_chunks = stage_bytes / stage_chunk;
-
-/**
- * @brief Starts copying the `src_bytes` (<= 16) bytes at the 16-byte aligned `src` to `dst` in shared
- * memory and zero-fills the rest of the 16 bytes.
- */
-__device__ __forceinline__ void copy16_async(uint32_t* dst, uintptr_t src, uint32_t src_bytes)
-{
-  auto const shared = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(shared),
-               "l"(src),
-               "r"(src_bytes)
-               : "memory");
-}
-
-__device__ __forceinline__ void commit_async() { asm volatile("cp.async.commit_group;" ::: "memory"); }
-
-__device__ __forceinline__ void wait_async() { asm volatile("cp.async.wait_all;" ::: "memory"); }
-
 /**
  * @brief Warp-wide inclusive sum of 32-bit values; each step is one shuffle and one predicated add.
  */
@@ -835,8 +812,7 @@ __device__ __forceinline__ void sum_pair(uint32_t xa,
  * word, so one address serves all four loads.
  */
 template <uint32_t W>
-__device__ __forceinline__ void unpack_mini_block64(uint32_t const* words,
-                                                    uint32_t bit0,
+__device__ __forceinline__ void unpack_mini_block64(uint8_t const* q,
                                                     uint32_t lane,
                                                     uint32_t& xa,
                                                     uint32_t& xb)
@@ -845,17 +821,16 @@ __device__ __forceinline__ void unpack_mini_block64(uint32_t const* words,
     xa = 0;
     xb = 0;
   } else {
-    // `words` is staged page data in shared memory.
-    __builtin_assume(__isShared(words));
-    uint32_t const bit   = bit0 + lane * W;
-    auto const* const w  = words + bit / 32;
+    auto const addr      = reinterpret_cast<uintptr_t>(q);
+    uint32_t const bit   = static_cast<uint32_t>(addr % 4) * byte_bits + lane * W;
+    auto const* const w  = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
     uint32_t const shift = bit % 32;
     constexpr uint32_t mask = W < 32 ? (1u << W) - 1 : ~0u;
     bool const spans        = shift + W > 32;
-    uint32_t const a0       = w[0];
-    uint32_t const b0       = w[W];
-    uint32_t const a1       = spans ? w[1] : 0u;
-    uint32_t const b1       = spans ? w[W + 1] : 0u;
+    uint32_t const a0       = __ldg(w);
+    uint32_t const b0       = __ldg(w + W);
+    uint32_t const a1       = spans ? __ldg(w + 1) : 0u;
+    uint32_t const b1       = spans ? __ldg(w + W + 1) : 0u;
     xa                      = __funnelshift_r(a0, a1, shift) & mask;
     xb                      = __funnelshift_r(b0, b1, shift) & mask;
   }
@@ -869,8 +844,7 @@ __device__ __forceinline__ void unpack_mini_block64(uint32_t const* words,
  * receives each mini-block's two values in order.
  */
 template <uint32_t W, typename acc_t, typename Place>
-__device__ __forceinline__ void decode_uniform_block64(uint32_t const* words,
-                                                       uint32_t bit0,
+__device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
                                                        uint32_t lane,
                                                        acc_t lane_min_delta,
                                                        acc_t pass_min_delta,
@@ -885,10 +859,9 @@ __device__ __forceinline__ void decode_uniform_block64(uint32_t const* words,
       x[k] = 0;
     }
   } else {
-    // `words` is staged page data in shared memory.
-    __builtin_assume(__isShared(words));
-    uint32_t const bit   = bit0 + lane * W;
-    auto const* const w  = words + bit / 32;
+    auto const addr      = reinterpret_cast<uintptr_t>(q);
+    uint32_t const bit   = static_cast<uint32_t>(addr % 4) * byte_bits + lane * W;
+    auto const* const w  = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
     uint32_t const shift = bit % 32;
     constexpr uint32_t mask = W < 32 ? (1u << W) - 1 : ~0u;
     bool const spans        = shift + W > 32;
@@ -896,8 +869,8 @@ __device__ __forceinline__ void decode_uniform_block64(uint32_t const* words,
     uint32_t hi[passes];
 #pragma unroll
     for (uint32_t k = 0; k < passes; ++k) {
-      lo[k] = w[k * W];
-      hi[k] = spans ? w[k * W + 1] : 0u;
+      lo[k] = __ldg(w + k * W);
+      hi[k] = spans ? __ldg(w + k * W + 1) : 0u;
     }
 #pragma unroll
     for (uint32_t k = 0; k < passes; ++k) {
@@ -1184,7 +1157,6 @@ struct rank_map_output {
  * @param data Start of the DELTA_BINARY_PACKED stream
  * @param end End of the page data
  * @param nz_count Number of values to decode
- * @param stage_buffers Two buffers of `stage_words` words of shared memory for staged page data
  * @param output Places the decoded values
  * @return 0, `DELTA_PARAMS_UNSUPPORTED` if the page header or a mini-block bit width is invalid,
  * or `DATA_STREAM_OVERRUN` if the page holds fewer than `nz_count` values
@@ -1194,7 +1166,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                                                 uint8_t const* data,
                                                 uint8_t const* end,
                                                 uint32_t nz_count,
-                                                uint32_t* stage_buffers,
                                                 rank_map_output<Width, Mapped>& output)
 {
   // 32-bit outputs need only the low 32 bits of every sum.
@@ -1238,27 +1209,28 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     prefetched += prefetch_window;
   };
 
-  // Each block's bytes are copied into one of two shared-memory buffers while the previous block
-  // is decoded. `staged_base` and `staged_len` describe the latest copy, into buffer `staged_buf`.
-  uintptr_t staged_base = 0;
-  uint32_t staged_len   = 0;
-  uint32_t staged_buf   = 0;
-  auto stage            = [&](uint32_t buf, uintptr_t at, uint32_t bytes) {
-    auto const base = at & ~uintptr_t{stage_chunk - 1};
-    auto const chunks =
-      cuda::std::min(uint32_t{stage_chunks}, static_cast<uint32_t>((at - base + bytes + stage_chunk - 1) / stage_chunk));
-    uint32_t* const dst = stage_buffers + buf * stage_words;
-    for (uint32_t c = lane; c < chunks; c += warp_lanes) {
-      auto const src = base + stage_chunk * c;
-      auto const n   = src < page_end
-                         ? static_cast<uint32_t>(cuda::std::min(uintptr_t{stage_chunk}, page_end - src))
-                         : 0u;
-      copy16_async(dst + c * (stage_chunk / sizeof(uint32_t)), n != 0 ? src : base, n);
+  // Starts moving the first two lines of the block at `at` (its header and the start of its packed
+  // values) into L1 one block ahead.
+  auto stage = [&](uint8_t const* at) {
+    if (lane < 2) {
+      auto const line = (reinterpret_cast<uintptr_t>(at) & ~uintptr_t{cache_line_bytes - 1}) +
+                        lane * cache_line_bytes;
+      if (line < page_end) { asm volatile("prefetch.global.L1 [%0];" ::"l"(line)); }
     }
-    commit_async();
-    staged_base = base;
-    staged_len  = chunks * stage_chunk;
-    staged_buf  = buf;
+  };
+
+  // Page data is also moved from L2 into L1 ahead of the read position, in bursts of eight lines.
+  constexpr uint32_t l1_window = 8 * cache_line_bytes;
+  uintptr_t l1_prefetched      = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
+  auto l1_prefetch             = [&](uintptr_t cursor) {
+    if (cursor + l1_window > l1_prefetched) {
+      l1_prefetched = cuda::std::max(l1_prefetched, cursor & ~uintptr_t{cache_line_bytes - 1});
+      auto const line = l1_prefetched + lane * cache_line_bytes;
+      if (lane < l1_window / cache_line_bytes && line < page_end) {
+        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
+      }
+      l1_prefetched += l1_window;
+    }
   };
 
   bool error = false;
@@ -1270,28 +1242,15 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     uint8_t const* widths   = p;  // Bit widths, when not `packed`
     uint8_t const* mb_start = nullptr;
     bool packed             = false;
-    // The staged copy holding this block, issued during the previous block
-    wait_async();
-    warp.sync();
-    auto const block_at = reinterpret_cast<uintptr_t>(p);
-    if (block_at < staged_base or block_at + header_bytes > staged_base + staged_len) {
-      stage(staged_buf ^ 1, block_at, stage_bytes);
-      wait_async();
-      warp.sync();
-    }
-    uintptr_t current_base           = staged_base;
-    uint32_t current_len             = staged_len;
-    uint32_t const* current_words    = stage_buffers + staged_buf * stage_words;
     {
       // Common case: a minimum delta of at most four bytes and at most four bit widths, all within
-      // one 8-byte window of the staged copy. Bytes past the end of the page are staged as zero.
+      // one 8-byte window.
       auto const aligned = aligned_word(p);
-      if (mb_count <= 4) {
-        auto const* const staged =
-          reinterpret_cast<uint64_t const*>(current_words) + (aligned - current_base) / word_bytes;
+      if (mb_count <= 4 && aligned + 2 * word_bytes <= page_end) {
+        auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
         uint64_t const window = extract64(
-          staged[0],
-          staged[1],
+          __ldg(src),
+          __ldg(src + 1),
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p) - aligned) * byte_bits);
         uint32_t const stop = ~static_cast<uint32_t>(window) & 0x8080'8080u;
         if (stop != 0) {
@@ -1412,38 +1371,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
       }
       next_block = mb_start + static_cast<size_t>(mb_bytes_per_bit) * width_sum;
+      if (next_block >= mb_start) { stage(next_block); }
     }
     if (reinterpret_cast<uintptr_t>(mb_start) + prefetch_window / 2 > prefetched &&
         prefetched < page_end) {
       prefetch_burst();
     }
-    auto const mb_end =
-      reinterpret_cast<uintptr_t>(mb_start) + static_cast<size_t>(mb_bytes_per_bit) * width_sum;
-    // Blocks of 64-value mini-blocks are read from a staged copy, so they must fit in one buffer,
-    // including the word read past their packed values.
-    bool const fits_stage = passes_per_mb != 2 or (mb_end + sizeof(uint32_t) -
-                                                   (block_at & ~uintptr_t{stage_chunk - 1})) <=
-                                                    stage_bytes;
-    bool const fast = packed and whole_block and widths_fit and passes_per_mb <= 2 and
-                      block_passes % 2 == 0 and fits_stage and
-                      (Mapped or static_cast<int32_t>(position) >= output.first_row) and
-                      mb_end <= page_end;
-    // A fast block of 64-value mini-blocks is read from the staged copy; restage it if the copy
-    // was sized for a shorter block. The words read include one past the packed values.
-    if (fast and passes_per_mb == 2 and mb_end + sizeof(uint32_t) > current_base + current_len) {
-      stage(staged_buf ^ 1, block_at, static_cast<uint32_t>(mb_end - block_at) + sizeof(uint32_t));
-      wait_async();
-      warp.sync();
-      current_base  = staged_base;
-      current_len   = staged_len;
-      current_words = stage_buffers + staged_buf * stage_words;
-    }
-    // Stage the following block, assuming it is about as long as this one.
-    if (next_block != nullptr and next_block >= mb_start and next_block < end) {
-      stage(staged_buf ^ 1,
-            reinterpret_cast<uintptr_t>(next_block),
-            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(next_block) - block_at) + 64);
-    }
+    l1_prefetch(reinterpret_cast<uintptr_t>(mb_start));
 
     auto const min_delta = static_cast<acc_t>(min_delta_bits);
     // `min_delta` contributions of a lane's value and of a whole pass
@@ -1453,7 +1387,10 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     // A whole block of 32- or 64-value mini-blocks whose packed values all lie within the page is
     // decoded two passes at a time with no per-pass checks: the two halves of one 64-value
     // mini-block, or two 32-value mini-blocks.
-    if (fast) {
+    if (packed and whole_block and widths_fit and passes_per_mb <= 2 and block_passes % 2 == 0 and
+        (Mapped or static_cast<int32_t>(position) >= output.first_row) and
+        reinterpret_cast<uintptr_t>(mb_start) + static_cast<size_t>(mb_bytes_per_bit) * width_sum <=
+          page_end) {
       uint32_t const mb_shift = passes_per_mb - 1;
       uint8_t const* q        = mb_start;
       // Output of this lane's value in the block's first pass, when not `Mapped`
@@ -1472,12 +1409,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       if constexpr (not Mapped and Width != 0) {
         // Bytes 0 .. mb_count - 1 set to one
         uint64_t const mb_bytes_one =
-          mb_count < max_packed_widths ? 0x0101'0101'0101'0101ull & ((uint64_t{1} << (byte_bits * mb_count)) - 1)
-                                       : 0x0101'0101'0101'0101ull;
+          mb_count < max_packed_widths
+            ? 0x0101'0101'0101'0101ull & ((uint64_t{1} << (byte_bits * mb_count)) - 1)
+            : 0x0101'0101'0101'0101ull;
         if (mb_shift != 0 and packed_widths == (packed_widths & 0xffu) * mb_bytes_one) {
           // 64-value mini-blocks of one compile-time width, four at a time
           dispatch_width<wide>(static_cast<uint32_t>(packed_widths & 0xffu), [&]<uint32_t W>() {
-            auto place_staged = [&](acc_t va, acc_t vb) {
+            auto place_values = [&](acc_t va, acc_t vb) {
               int32_t const row_a = output.load_row(position + lane, value_limit);
               int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
               place_pair(va, vb, row_a, row_b);
@@ -1486,29 +1424,18 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             constexpr uint32_t mb_bytes = 2 * W * pass_bytes_per_bit;
             uint32_t m                  = 0;
             for (; m + 4 <= mb_count; m += 4) {
-              auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
-              decode_uniform_block64<W, acc_t>(current_words + offset / sizeof(uint32_t),
-                                               (offset % sizeof(uint32_t)) * byte_bits,
-                                               lane,
-                                               lane_min_delta,
-                                               pass_min_delta,
-                                               carry,
-                                               place_staged);
+              decode_uniform_block64<W, acc_t>(
+                q, lane, lane_min_delta, pass_min_delta, carry, place_values);
               q += 4 * mb_bytes;
             }
             for (; m < mb_count; ++m) {
-              auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
               uint32_t xa;
               uint32_t xb;
-              unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
-                                     (offset % sizeof(uint32_t)) * byte_bits,
-                                     lane,
-                                     xa,
-                                     xb);
+              unpack_mini_block64<W>(q, lane, xa, xb);
               acc_t va;
               acc_t vb;
               sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-              place_staged(va, vb);
+              place_values(va, vb);
               q += mb_bytes;
             }
           });
@@ -1526,13 +1453,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             dispatch_width<wide>(w, [&]<uint32_t W>() {
               uint32_t xa;
               uint32_t xb;
-              auto const offset =
-                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
-              unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
-                                     (offset % sizeof(uint32_t)) * byte_bits,
-                                     lane,
-                                     xa,
-                                     xb);
+              unpack_mini_block64<W>(q, lane, xa, xb);
               sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
             });
             q += w * 2 * pass_bytes_per_bit;
@@ -1697,8 +1618,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     if (error) { break; }
     p = next_block;
   }
-  // No copy may still target the shared buffers when the block exits.
-  wait_async();
   if (error) {
     return static_cast<kernel_error::value_type>(decode_error::DELTA_PARAMS_UNSUPPORTED);
   }
@@ -1723,7 +1642,6 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
   size_t num_rows)
 {
   __shared__ __align__(16) full_page_decode_state state_g;
-  __shared__ __align__(16) uint32_t stage_buffers[2 * nz_lean_delta::stage_words];
   auto* const s = &state_g;
 
   [[maybe_unused]] null_count_back_copier _{s, static_cast<int32_t>(warp.thread_rank())};
@@ -1763,7 +1681,6 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
                                                   s->stream.data_start,
                                                   s->stream.data_end,
                                                   static_cast<uint32_t>(nz_count),
-                                                  stage_buffers,
                                                   output);
     if (error == 0) { output.fill_tail(static_cast<uint32_t>(nz_count)); }
     return error;
