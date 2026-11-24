@@ -652,7 +652,7 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
  */
 __device__ __forceinline__ void touch_l1(uintptr_t line)
 {
-  uint32_t unused;
+  [[maybe_unused]] uint32_t unused;
   asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(unused) : "l"(line));
 }
 
