@@ -909,9 +909,9 @@ __device__ __forceinline__ void sum8(uint32_t const (&x)[8],
 {
   constexpr uint32_t passes = 8;
   constexpr bool wide       = sizeof(acc_t) == sizeof(uint64_t);
-  // Narrow blocks keep the shared-scan path below, whose packed totals are cheaper than a running
-  // sum.
-  if (max_width > max_paired_width and (not wide or max_width <= max_running_width)) {
+  // The narrowest blocks keep the three-pass scans below, whose packed totals are cheaper than a
+  // running sum.
+  if (max_width > max_tripled_width and (not wide or max_width <= max_running_width)) {
     // Exact 32-bit prefixes of each pass, from shared scans where the widths allow
     uint32_t prefix[passes];
     if (max_width == 0) {
