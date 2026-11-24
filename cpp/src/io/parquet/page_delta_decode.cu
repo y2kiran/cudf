@@ -597,6 +597,8 @@ static_assert(prefetch_window % (cache_line_bytes * warp_lanes) == 0,
 // The 32 normalized deltas of a pass at this width or below sum below 2^16 (32 * 2047 < 65536), so
 // two passes share one 32-bit scan
 constexpr uint32_t max_paired_width = 11;
+// Up to this width the totals of eight passes sum below 2^32 (8 * 32 * (2^24 - 1) < 2^32)
+constexpr uint32_t max_running_width = 24;
 // The 32 normalized deltas of a pass at this width or below sum below 2^10 (32 * 31 < 1024), so
 // three passes share one 32-bit scan
 constexpr uint32_t max_tripled_width = 5;
@@ -647,6 +649,16 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
   if (word >= end) { return 0; }
   if (word + word_bytes > end) { w &= (uint64_t{1} << (byte_bits * (end - word))) - 1; }
   return w;
+}
+
+/**
+ * @brief Returns `a * b + c` with a 64-bit `c`, as one wide multiply-add on the FMA pipe.
+ */
+__device__ __forceinline__ uint64_t mad_wide(uint32_t a, uint32_t b, uint64_t c)
+{
+  uint64_t result;
+  asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(result) : "r"(a), "r"(b), "l"(c));
+  return result;
 }
 
 /**
@@ -896,6 +908,80 @@ __device__ __forceinline__ void sum8(uint32_t const (&x)[8],
                                      Place&& place)
 {
   constexpr uint32_t passes = 8;
+  constexpr bool wide       = sizeof(acc_t) == sizeof(uint64_t);
+  if (not wide or max_width <= max_running_width) {
+    // Exact 32-bit prefixes of each pass, from shared scans where the widths allow
+    uint32_t prefix[passes];
+    if (max_width == 0) {
+#pragma unroll
+      for (uint32_t k = 0; k < passes; ++k) {
+        prefix[k] = 0;
+      }
+    } else if (max_width <= max_tripled_width) {
+      constexpr uint32_t field_bits = 10;
+      constexpr uint32_t field_mask = (1u << field_bits) - 1;
+#pragma unroll
+      for (uint32_t g = 0; g < (passes + 2) / 3; ++g) {
+        uint32_t fields = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < 3 and 3 * g + j < passes; ++j) {
+          fields |= x[3 * g + j] << (field_bits * j);
+        }
+        uint32_t const sums = inclusive_sum32(fields);
+#pragma unroll
+        for (uint32_t j = 0; j < 3 and 3 * g + j < passes; ++j) {
+          prefix[3 * g + j] = (sums >> (field_bits * j)) & field_mask;
+        }
+      }
+    } else if (max_width <= max_paired_width) {
+#pragma unroll
+      for (uint32_t k = 0; k < passes; k += 2) {
+        uint32_t const sums = inclusive_sum32(x[k] | (x[k + 1] << 16));
+        prefix[k]           = sums & 0xffffu;
+        prefix[k + 1]       = sums >> 16;
+      }
+    } else {
+#pragma unroll
+      for (uint32_t k = 0; k < passes; ++k) {
+        prefix[k] = inclusive_sum32(x[k]);
+      }
+    }
+    // Value k is carry + (lane + 1) * min_delta + k * pass_min_delta plus the totals of passes
+    // before k and this lane's prefix; that 32-bit sum is `running + prefix[k]`, and lane 31's sum
+    // is the next pass's `running`. The 64-bit adds use the FMA pipe (multiplying by `one`, which
+    // the compiler cannot fold), leaving the integer ALU pipe to the unpacking.
+    uint32_t running = 0;
+    acc_t v[passes];
+    if constexpr (wide) {
+      uint32_t const one    = static_cast<uint32_t>(__popc(__ballot_sync(0xffff'ffffu, true))) /
+                           warp_lanes;
+      auto const pass_lo = static_cast<uint32_t>(pass_min_delta);
+      auto const pass_hi = static_cast<uint32_t>(pass_min_delta >> 32);
+      uint64_t base      = carry + lane_min_delta;
+#pragma unroll
+      for (uint32_t k = 0; k < passes; ++k) {
+        uint32_t const sum = running + prefix[k];
+        v[k]               = mad_wide(sum, one, base);
+        running            = __shfl_sync(0xffff'ffffu, sum, warp_lanes - 1);
+        uint64_t const t   = mad_wide(one, pass_lo, base);
+        base = (static_cast<uint64_t>(static_cast<uint32_t>(t >> 32) + one * pass_hi) << 32) |
+               static_cast<uint32_t>(t);
+        if (k % 2 == 1) { place(v[k - 1], v[k]); }
+      }
+    } else {
+      acc_t base = carry + lane_min_delta;
+#pragma unroll
+      for (uint32_t k = 0; k < passes; ++k) {
+        uint32_t const sum = running + prefix[k];
+        v[k]               = base + sum;
+        running            = __shfl_sync(0xffff'ffffu, sum, warp_lanes - 1);
+        base += pass_min_delta;
+        if (k % 2 == 1) { place(v[k - 1], v[k]); }
+      }
+    }
+    carry += passes * pass_min_delta + static_cast<acc_t>(running);
+    return;
+  }
   if (sizeof(acc_t) == sizeof(uint64_t) and max_width > max_narrow_width) {
     sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
   } else if (max_width != 0 and max_width <= max_tripled_width) {
