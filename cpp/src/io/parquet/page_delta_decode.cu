@@ -941,6 +941,51 @@ __device__ __forceinline__ void sum8(uint32_t const (&x)[8],
  * issues all of the block's payload loads from one address before unpacking and scanning. `place`
  * receives each mini-block's two values in order.
  */
+/**
+ * @brief This lane's packed words of a block of four 64-value mini-blocks of width `W`, loaded
+ * ahead of their unpacking.
+ */
+template <uint32_t W>
+struct uniform_words {
+  uint32_t lo[8];
+  uint32_t hi[8];
+  uint32_t shift;
+};
+
+template <uint32_t W>
+__device__ __forceinline__ void load_uniform_words(uint8_t const* q,
+                                                   uint32_t lane,
+                                                   uniform_words<W>& words)
+{
+  if constexpr (W != 0) {
+    auto const addr     = reinterpret_cast<uintptr_t>(q);
+    uint32_t const bit  = static_cast<uint32_t>(addr % 4) * byte_bits + lane * W;
+    auto const* const w = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
+    words.shift         = bit % 32;
+    bool const spans    = words.shift + W > 32;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+      words.lo[k] = __ldg(w + k * W);
+      words.hi[k] = spans ? __ldg(w + k * W + 1) : 0u;
+    }
+  }
+}
+
+template <uint32_t W>
+__device__ __forceinline__ void unpack_uniform_words(uniform_words<W> const& words,
+                                                     uint32_t (&x)[8])
+{
+  constexpr uint32_t mask = W < 32 ? (1u << W) - 1 : ~0u;
+#pragma unroll
+  for (uint32_t k = 0; k < 8; ++k) {
+    if constexpr (W == 0) {
+      x[k] = 0;
+    } else {
+      x[k] = __funnelshift_r(words.lo[k], words.hi[k], words.shift) & mask;
+    }
+  }
+}
+
 template <uint32_t W, typename acc_t, typename Place>
 __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
                                                        uint32_t lane,
@@ -1544,73 +1589,89 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
               constexpr uint32_t touch_blocks =
                 cuda::std::max(1u, (warp_lanes * 32) / (block_bytes + 8));
               uint32_t touch_countdown = 1;
+              // Software pipeline: the payload of the next block is loaded while this block's
+              // values are summed and stored.
+              uint32_t x[8];
+              {
+                uniform_words<W> words;
+                load_uniform_words<W>(block_q, lane, words);
+                unpack_uniform_words<W>(words, x);
+              }
               while (true) {
-                decode_uniform_block64<W, acc_t>(block_q,
-                                                 lane,
-                                                 block_lane_min_delta,
-                                                 block_pass_min_delta,
-                                                 carry,
-                                                 place_values);
-                p = block_next;
-                if (position + block_values > value_limit) { return; }
-                auto const at2      = reinterpret_cast<uintptr_t>(p);
-                auto const aligned2 = at2 & ~uintptr_t{word_bytes - 1};
-                if (aligned2 + 2 * word_bytes > page_end) { return; }
-                if (at2 >= next_step) {
-                  auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
-                  if (lane < 16 and line < page_end) {
-                    asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+                // Parse the next block's header if it has the same shape and lies wholly in the
+                // page and in the values to decode.
+                uint8_t const* next_q    = nullptr;
+                uint8_t const* next_next = nullptr;
+                uint64_t v2              = 0;
+                bool next_ok             = position + 2 * block_values <= value_limit;
+                auto const at2           = reinterpret_cast<uintptr_t>(block_next);
+                auto const aligned2      = at2 & ~uintptr_t{word_bytes - 1};
+                next_ok = next_ok and aligned2 + 2 * word_bytes <= page_end;
+                if (next_ok) {
+                  if (at2 >= next_step) {
+                    auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
+                    if (lane < 16 and line < page_end) {
+                      asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+                    }
+                    next_step += steady_step;
                   }
-                  next_step += steady_step;
-                }
-                auto const* const src2 = reinterpret_cast<unsigned long long const*>(aligned2);
-                auto const shift2      = static_cast<uint32_t>(at2 - aligned2) * byte_bits;
-                uint64_t const w21     = __ldg(src2 + 1);
-                uint64_t const window2 = extract64(__ldg(src2), w21, shift2);
-                uint32_t const stop2   = ~static_cast<uint32_t>(window2) & 0x8080'8080u;
-                uint32_t len2;
-                uint64_t v2;
-                if ((window2 & 0x80u) == 0) {
-                  // A one-byte minimum delta
-                  len2 = 1;
-                  if (static_cast<uint32_t>(window2 >> byte_bits) != widths_w) { return; }
-                  v2 = window2 & 0x7fu;
-                } else if (stop2 != 0) {
-                  // A minimum delta of at most four bytes, so the window holds the four widths.
-                  len2 = static_cast<uint32_t>(__ffs(static_cast<int>(stop2))) / byte_bits;
-                  if (static_cast<uint32_t>(window2 >> (byte_bits * len2)) != widths_w) { return; }
-                  uint32_t const x2 = static_cast<uint32_t>(window2) &
-                                      (len2 < 4 ? (1u << (byte_bits * len2)) - 1 : ~0u);
-                  v2 = (x2 & 0x7fu) | ((x2 >> 1) & 0x3f80u) | ((x2 >> 2) & 0x1f'c000u) |
-                       ((x2 >> 3) & 0xfe0'0000u);
-                } else {
-                  // A longer minimum delta, from 16 bytes of header
-                  if (aligned2 + 3 * word_bytes > page_end) { return; }
-                  uint64_t const hi2 = extract64(w21, __ldg(src2 + 2), shift2);
-                  constexpr uint64_t continuation_bits = 0x8080'8080'8080'8080ull;
-                  uint64_t const stop_lo               = ~window2 & continuation_bits;
-                  uint64_t const stop_hi               = ~hi2 & continuation_bits;
-                  len2 = stop_lo != 0 ? stop_byte_count(stop_lo)
-                                      : (stop_hi != 0 ? word_bytes + stop_byte_count(stop_hi)
-                                                      : header_bytes + 1);
-                  if (len2 > max_varint_bytes) { return; }
-                  auto const widths2 = static_cast<uint32_t>(
-                    len2 < word_bytes
-                      ? (window2 >> (byte_bits * len2)) | (hi2 << (word_bits - byte_bits * len2))
-                      : hi2 >> (byte_bits * (len2 - word_bytes)));
-                  if (widths2 != widths_w) { return; }
-                  v2 = 0;
+                  auto const* const src2 = reinterpret_cast<unsigned long long const*>(aligned2);
+                  auto const shift2      = static_cast<uint32_t>(at2 - aligned2) * byte_bits;
+                  uint64_t const w21     = __ldg(src2 + 1);
+                  uint64_t const window2 = extract64(__ldg(src2), w21, shift2);
+                  uint32_t const stop2   = ~static_cast<uint32_t>(window2) & 0x8080'8080u;
+                  uint32_t len2          = 0;
+                  if ((window2 & 0x80u) == 0) {
+                    // A one-byte minimum delta
+                    len2    = 1;
+                    next_ok = static_cast<uint32_t>(window2 >> byte_bits) == widths_w;
+                    v2      = window2 & 0x7fu;
+                  } else if (stop2 != 0) {
+                    // A minimum delta of at most four bytes, so the window holds the widths.
+                    len2    = static_cast<uint32_t>(__ffs(static_cast<int>(stop2))) / byte_bits;
+                    next_ok = static_cast<uint32_t>(window2 >> (byte_bits * len2)) == widths_w;
+                    uint32_t const x2 = static_cast<uint32_t>(window2) &
+                                        (len2 < 4 ? (1u << (byte_bits * len2)) - 1 : ~0u);
+                    v2 = (x2 & 0x7fu) | ((x2 >> 1) & 0x3f80u) | ((x2 >> 2) & 0x1f'c000u) |
+                         ((x2 >> 3) & 0xfe0'0000u);
+                  } else if (aligned2 + 3 * word_bytes > page_end) {
+                    next_ok = false;
+                  } else {
+                    // A longer minimum delta, from 16 bytes of header
+                    uint64_t const hi2 = extract64(w21, __ldg(src2 + 2), shift2);
+                    constexpr uint64_t continuation_bits = 0x8080'8080'8080'8080ull;
+                    uint64_t const stop_lo               = ~window2 & continuation_bits;
+                    uint64_t const stop_hi               = ~hi2 & continuation_bits;
+                    len2 = stop_lo != 0 ? stop_byte_count(stop_lo)
+                                        : (stop_hi != 0 ? word_bytes + stop_byte_count(stop_hi)
+                                                        : header_bytes + 1);
+                    auto const widths2 = static_cast<uint32_t>(
+                      len2 < word_bytes
+                        ? (window2 >> (byte_bits * len2)) | (hi2 << (word_bits - byte_bits * len2))
+                        : hi2 >> (byte_bits * (len2 - word_bytes)));
+                    next_ok = len2 <= max_varint_bytes and widths2 == widths_w;
 #pragma unroll
-                  for (uint32_t i = 0; i < max_varint_bytes; ++i) {
-                    uint64_t const byte = (i < word_bytes ? window2 >> (byte_bits * i)
-                                                          : hi2 >> (byte_bits * (i - word_bytes))) &
-                                          0x7f;
-                    if (i < len2) { v2 |= byte << (7 * i); }
+                    for (uint32_t i = 0; i < max_varint_bytes; ++i) {
+                      uint64_t const byte = (i < word_bytes ? window2 >> (byte_bits * i)
+                                                            : hi2 >> (byte_bits * (i - word_bytes))) &
+                                            0x7f;
+                      if (i < len2) { v2 |= byte << (7 * i); }
+                    }
                   }
+                  next_q    = block_next + len2 + 4;
+                  next_next = next_q + block_bytes;
+                  next_ok   = next_ok and reinterpret_cast<uintptr_t>(next_next) <= page_end;
                 }
-                block_q    = p + len2 + 4;
-                block_next = block_q + block_bytes;
-                if (reinterpret_cast<uintptr_t>(block_next) > page_end) { return; }
+                uniform_words<W> words;
+                if (next_ok) { load_uniform_words<W>(next_q, lane, words); }
+
+                sum8<acc_t>(x, W, block_lane_min_delta, block_pass_min_delta, carry, place_values);
+                p = block_next;
+                if (not next_ok) { return; }
+
+                unpack_uniform_words<W>(words, x);
+                block_q    = next_q;
+                block_next = next_next;
                 // One touch per sector covers `warp_lanes` sectors, the next `touch_blocks`
                 // blocks of this size; touch them once, `touch_blocks` blocks ahead.
                 if (--touch_countdown == 0) {
