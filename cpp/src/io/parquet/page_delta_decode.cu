@@ -1403,8 +1403,9 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         position += 2 * warp_lanes;
       };
-      // The width-templated paths are instantiated only for native integer outputs without nulls,
-      // which bounds the code size; other pages use the runtime-width loop below.
+      // Blocks whose 64-value mini-blocks share one width use a width-templated path, instantiated
+      // only for native integer outputs without nulls. Other blocks use the runtime-width loop
+      // below, which keeps one compact body for mixed widths and bounds the instruction footprint.
       if constexpr (not Mapped and Width != 0) {
         // Bytes 0 .. mb_count - 1 set to one
         uint64_t const mb_bytes_one =
@@ -1444,26 +1445,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
               q += mb_bytes;
             }
           });
-          p = next_block;
-          continue;
-        }
-        if (mb_shift != 0) {
-          // 64-value mini-blocks, each at a compile-time width
-          for (uint32_t m = 0; m < mb_count; ++m) {
-            auto const w = static_cast<uint32_t>(packed_widths >> (byte_bits * m)) & 0xffu;
-            int32_t const row_a = output.load_row(position + lane, value_limit);
-            int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
-            acc_t va{};
-            acc_t vb{};
-            dispatch_width<wide>(w, [&]<uint32_t W>() {
-              uint32_t xa;
-              uint32_t xb;
-              unpack_mini_block64<W>(q, lane, xa, xb);
-              sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-            });
-            q += w * 2 * pass_bytes_per_bit;
-            place_pair(va, vb, row_a, row_b);
-          }
           p = next_block;
           continue;
         }
