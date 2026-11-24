@@ -1419,8 +1419,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     }
     auto const mb_end =
       reinterpret_cast<uintptr_t>(mb_start) + static_cast<size_t>(mb_bytes_per_bit) * width_sum;
+    // Blocks of 64-value mini-blocks are read from a staged copy, so they must fit in one buffer,
+    // including the word read past their packed values.
+    bool const fits_stage = passes_per_mb != 2 or (mb_end + sizeof(uint32_t) -
+                                                   (block_at & ~uintptr_t{stage_chunk - 1})) <=
+                                                    stage_bytes;
     bool const fast = packed and whole_block and widths_fit and passes_per_mb <= 2 and
-                      block_passes % 2 == 0 and
+                      block_passes % 2 == 0 and fits_stage and
                       (Mapped or static_cast<int32_t>(position) >= output.first_row) and
                       mb_end <= page_end;
     // A fast block of 64-value mini-blocks is read from the staged copy; restage it if the copy
