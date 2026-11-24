@@ -650,6 +650,16 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
 }
 
 /**
+ * @brief Returns `a * b + c` with a 64-bit `c`, as one wide multiply-add on the FMA pipe.
+ */
+__device__ __forceinline__ uint64_t mad_wide(uint32_t a, uint32_t b, uint64_t c)
+{
+  uint64_t result;
+  asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(result) : "r"(a), "r"(b), "l"(c));
+  return result;
+}
+
+/**
  * @brief Warp-wide inclusive sum of 32-bit values; each step is one shuffle and one predicated add.
  */
 __device__ __forceinline__ uint32_t inclusive_sum32(uint32_t x)
@@ -915,12 +925,36 @@ __device__ __forceinline__ void sum8(uint32_t const (&x)[8],
       all[g]  = __shfl_sync(0xffff'ffffu, sums[g], warp_lanes - 1);
     }
     acc_t v[passes];
+    if constexpr (sizeof(acc_t) == sizeof(uint64_t)) {
+      // Value k is base_k plus the totals of the earlier passes and this lane's prefix (a small
+      // 32-bit sum), where base_k = carry + (lane + 1) * min_delta + k * pass_min_delta. The 64-bit
+      // adds run as wide multiply-adds by `one`, which the compiler cannot fold, on the FMA pipe,
+      // leaving the integer ALU pipe to the field extraction.
+      uint32_t const one =
+        static_cast<uint32_t>(__popc(__ballot_sync(0xffff'ffffu, true))) / warp_lanes;
+      auto const pass_lo = static_cast<uint32_t>(pass_min_delta);
+      auto const pass_hi = static_cast<uint32_t>(pass_min_delta >> 32);
+      uint64_t base      = carry + lane_min_delta;
+      uint32_t earlier   = 0;
 #pragma unroll
-    for (uint32_t k = 0; k < passes; ++k) {
-      uint32_t const field = field_bits * (k % 3);
-      v[k] = carry + lane_min_delta + static_cast<acc_t>((sums[k / 3] >> field) & field_mask);
-      carry += static_cast<acc_t>((all[k / 3] >> field) & field_mask) + pass_min_delta;
-      if (k % 2 == 1) { place(v[k - 1], v[k]); }
+      for (uint32_t k = 0; k < passes; ++k) {
+        uint32_t const field = field_bits * (k % 3);
+        v[k] = mad_wide(earlier + ((sums[k / 3] >> field) & field_mask), one, base);
+        earlier += (all[k / 3] >> field) & field_mask;
+        uint64_t const t = mad_wide(one, pass_lo, base);
+        base = (static_cast<uint64_t>(static_cast<uint32_t>(t >> 32) + one * pass_hi) << 32) |
+               static_cast<uint32_t>(t);
+        if (k % 2 == 1) { place(v[k - 1], v[k]); }
+      }
+      carry += passes * pass_min_delta + earlier;
+    } else {
+#pragma unroll
+      for (uint32_t k = 0; k < passes; ++k) {
+        uint32_t const field = field_bits * (k % 3);
+        v[k] = carry + lane_min_delta + static_cast<acc_t>((sums[k / 3] >> field) & field_mask);
+        carry += static_cast<acc_t>((all[k / 3] >> field) & field_mask) + pass_min_delta;
+        if (k % 2 == 1) { place(v[k - 1], v[k]); }
+      }
     }
   } else {
 #pragma unroll
