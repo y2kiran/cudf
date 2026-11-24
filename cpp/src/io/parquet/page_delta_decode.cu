@@ -1234,6 +1234,129 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
 
   bool error = false;
   if (position < value_limit) { prefetch_burst(); }
+
+  // Steady state for pages without nulls: whole blocks of up to four 32- or 64-value mini-blocks
+  // whose minimum delta takes at most four bytes, so the header lies in one 8-byte window. The
+  // first block that does not qualify is left to the general loop below, unconsumed.
+  if constexpr (not Mapped) {
+    if (mb_count <= 4 and passes_per_mb <= 2 and block_passes % 2 == 0 and
+        static_cast<int32_t>(position) >= output.first_row) {
+      constexpr uint32_t bytes_one = 0x0101'0101u;
+      constexpr uint32_t top_bits  = bytes_one * 0x80;
+      constexpr uint32_t limit     = wide ? max_split_width : 32;
+      // Bytes 0 .. mb_count - 1 set to one
+      [[maybe_unused]] uint32_t const mb_ones = mb_count < 4 ? bytes_one & ((1u << (byte_bits * mb_count)) - 1)
+                                            : bytes_one;
+      uint32_t const mb_shift = passes_per_mb - 1;
+      uint8_t* out            = output.address(static_cast<int32_t>(position + lane));
+      // Every `steady_step` bytes of progress, lanes 0-15 move the lines `steady_step` ahead into
+      // L1 and lanes 16-31 the lines `2 * steady_step` ahead into L2, continuing the initial
+      // L2 burst of `prefetch_window` bytes.
+      constexpr uint32_t steady_step = 16 * cache_line_bytes;
+      uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
+      static_assert(prefetch_window == 2 * steady_step);
+      if (auto const line = next_step + lane * cache_line_bytes; lane < 16 and line < page_end) {
+        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
+      }
+      while (position + block_values <= value_limit) {
+        auto const at      = reinterpret_cast<uintptr_t>(p);
+        auto const aligned = at & ~uintptr_t{word_bytes - 1};
+        if (aligned + 2 * word_bytes > page_end) { break; }
+        if (at >= next_step) {
+          auto const line = next_step + (lane < 16 ? steady_step + lane * cache_line_bytes
+                                                   : 2 * steady_step + (lane - 16) * cache_line_bytes);
+          if (line < page_end) {
+            if (lane < 16) {
+              asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
+            } else {
+              asm volatile("prefetch.global.L2::evict_normal [%0];" ::"l"(line));
+            }
+          }
+          next_step += steady_step;
+        }
+        auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
+        uint64_t const window =
+          extract64(__ldg(src), __ldg(src + 1), static_cast<uint32_t>(at - aligned) * byte_bits);
+        uint32_t const stop = ~static_cast<uint32_t>(window) & 0x8080'8080u;
+        if (stop == 0) { break; }
+        // The lowest stop bit is bit 8 * len - 1.
+        auto const len = static_cast<uint32_t>(__ffs(static_cast<int>(stop))) / byte_bits;
+        uint32_t const x =
+          static_cast<uint32_t>(window) & (len < 4 ? (1u << (byte_bits * len)) - 1 : ~0u);
+        // Gather the seven-bit groups of the varint.
+        uint64_t const v = (x & 0x7fu) | ((x >> 1) & 0x3f80u) | ((x >> 2) & 0x1f'c000u) |
+                           ((x >> 3) & 0xfe0'0000u);
+        auto const widths = static_cast<uint32_t>(window >> (byte_bits * len)) &
+                            (mb_count < 4 ? (1u << (byte_bits * mb_count)) - 1 : ~0u);
+        uint32_t const width_sum = __dp4a(widths, bytes_one, 0u);
+        // A byte above `limit` has its top bit set, or sets it when `127 - limit` is added to its
+        // low seven bits, without carrying into the next byte.
+        bool const widths_fit = ((widths | ((widths & ~top_bits) + bytes_one * (127 - limit))) &
+                                 top_bits) == 0;
+        auto const* q          = p + len + mb_count;
+        auto const* const next = q + mb_bytes_per_bit * width_sum;
+        if (not widths_fit or reinterpret_cast<uintptr_t>(next) > page_end) { break; }
+
+        auto const min_delta       = static_cast<acc_t>(zigzag_decode(v));
+        acc_t const lane_min_delta = static_cast<acc_t>(lane + 1) * min_delta;
+        acc_t const pass_min_delta = static_cast<acc_t>(warp_lanes) * min_delta;
+        auto place_values          = [&](acc_t va, acc_t vb) {
+          out = output.store_pair(out, static_cast<uint64_t>(va), static_cast<uint64_t>(vb));
+          position += 2 * warp_lanes;
+        };
+        if constexpr (Width != 0) {
+          if (mb_shift != 0 and widths == (widths & 0xffu) * mb_ones) {
+            // 64-value mini-blocks of one compile-time width
+            dispatch_width<wide>(widths & 0xffu, [&]<uint32_t W>() {
+              if (mb_count == 4) {
+                decode_uniform_block64<W, acc_t>(
+                  q, lane, lane_min_delta, pass_min_delta, carry, place_values);
+                return;
+              }
+              for (uint32_t m = 0; m < mb_count; ++m) {
+                uint32_t xa;
+                uint32_t xb;
+                unpack_mini_block64<W>(q + m * 2 * W * pass_bytes_per_bit, lane, xa, xb);
+                acc_t va;
+                acc_t vb;
+                sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
+                place_values(va, vb);
+              }
+            });
+            p = next;
+            continue;
+          }
+        }
+        // Mixed widths: one runtime-width body for every width
+        for (uint32_t k = 0; k < block_passes; k += 2) {
+          auto const wa = (widths >> (byte_bits * (k >> mb_shift))) & 0xffu;
+          auto const wb = (widths >> (byte_bits * ((k + 1) >> mb_shift))) & 0xffu;
+          uint32_t xa   = 0;
+          uint32_t xb   = 0;
+          if (mb_shift != 0) {
+            if (wa != 0) {
+              lane_bits const bits{q, wa, lane};
+              xa = bits.get(0);
+              xb = bits.get(warp_lanes * wa);
+            }
+          } else {
+            if (wa != 0) { xa = lane_bits{q, wa, lane}.get(0); }
+            if (wb != 0) { xb = lane_bits{q + wa * pass_bytes_per_bit, wb, lane}.get(0); }
+          }
+          q += (wa + wb) * pass_bytes_per_bit;
+          acc_t va;
+          acc_t vb;
+          sum_pair<acc_t>(
+            xa, xb, cuda::std::max(wa, wb), lane_min_delta, pass_min_delta, carry, va, vb);
+          place_values(va, vb);
+        }
+        p = next;
+      }
+      // The general loop's prefetch bookkeeping resumes from here.
+      prefetched    = cuda::std::max(prefetched, next_step + 2 * steady_step);
+      l1_prefetched = cuda::std::max(l1_prefetched, next_step + steady_step);
+    }
+  }
   while (position < value_limit) {
     // Parse the header of the block at `p`.
     uint64_t min_delta_bits = 0;
@@ -1403,52 +1526,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         position += 2 * warp_lanes;
       };
-      // Blocks whose 64-value mini-blocks share one width use a width-templated path, instantiated
-      // only for native integer outputs without nulls. Other blocks use the runtime-width loop
-      // below, which keeps one compact body for mixed widths and bounds the instruction footprint.
-      if constexpr (not Mapped and Width != 0) {
-        // Bytes 0 .. mb_count - 1 set to one
-        uint64_t const mb_bytes_one =
-          mb_count < max_packed_widths
-            ? 0x0101'0101'0101'0101ull & ((uint64_t{1} << (byte_bits * mb_count)) - 1)
-            : 0x0101'0101'0101'0101ull;
-        if (mb_shift != 0 and packed_widths == (packed_widths & 0xffu) * mb_bytes_one) {
-          // 64-value mini-blocks of one compile-time width, four at a time
-          dispatch_width<wide>(static_cast<uint32_t>(packed_widths & 0xffu), [&]<uint32_t W>() {
-            auto place_values = [&](acc_t va, acc_t vb) {
-              int32_t const row_a = output.load_row(position + lane, value_limit);
-              int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
-              place_pair(va, vb, row_a, row_b);
-            };
-            // Packed bytes of one 64-value mini-block
-            constexpr uint32_t mb_bytes = 2 * W * pass_bytes_per_bit;
-            if (mb_count == 4) {
-              // The usual geometry: the whole block in one call
-              decode_uniform_block64<W, acc_t>(
-                q, lane, lane_min_delta, pass_min_delta, carry, place_values);
-              return;
-            }
-            uint32_t m = 0;
-            for (; m + 4 <= mb_count; m += 4) {
-              decode_uniform_block64<W, acc_t>(
-                q, lane, lane_min_delta, pass_min_delta, carry, place_values);
-              q += 4 * mb_bytes;
-            }
-            for (; m < mb_count; ++m) {
-              uint32_t xa;
-              uint32_t xb;
-              unpack_mini_block64<W>(q, lane, xa, xb);
-              acc_t va;
-              acc_t vb;
-              sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-              place_values(va, vb);
-              q += mb_bytes;
-            }
-          });
-          p = next_block;
-          continue;
-        }
-      }
       for (uint32_t k = 0; k < block_passes; k += 2) {
         auto const wa =
           static_cast<uint32_t>(packed_widths >> (byte_bits * (k >> mb_shift))) & 0xffu;
