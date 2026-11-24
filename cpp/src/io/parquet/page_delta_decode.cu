@@ -597,8 +597,6 @@ static_assert(prefetch_window % (cache_line_bytes * warp_lanes) == 0,
 // The 32 normalized deltas of a pass at this width or below sum below 2^16 (32 * 2047 < 65536), so
 // two passes share one 32-bit scan
 constexpr uint32_t max_paired_width = 11;
-// Up to this width a lane's two values of a mini-block lie within two 32-bit words
-constexpr uint32_t max_pair_width = 16;
 // The 32 normalized deltas of a pass at this width or below sum below 2^10 (32 * 31 < 1024), so
 // three passes share one 32-bit scan
 constexpr uint32_t max_tripled_width = 5;
@@ -1084,108 +1082,6 @@ __device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
   }
 }
 
-/**
- * @brief Decodes a block of four 64-value mini-blocks of compile-time width `W` (at most
- * `max_pair_width`) with two consecutive values per lane, and stores it at `out`, the output of
- * the block's first value.
- *
- * Lane `i` holds values 2i and 2i + 1 of each mini-block, 2W adjacent bits, so its 16-byte stores
- * (8-byte for 32-bit outputs) sit next to its neighbors' and each store instruction covers a
- * contiguous range. One scan of the lanes' pair sums per mini-block gives their starts; two
- * mini-blocks share a scan of 16-bit fields when their sums fit (W <= 10).
- */
-template <uint32_t W, uint32_t Width, typename acc_t>
-__device__ __forceinline__ void decode_pairs_uniform(
-  uint8_t const* q, uint32_t lane, acc_t min_delta, acc_t& carry, uint8_t* out)
-{
-  constexpr uint32_t mini_blocks = 4;
-  constexpr uint32_t mask        = W < 32 ? (1u << W) - 1 : ~0u;
-  uint32_t x0[mini_blocks];
-  uint32_t x1[mini_blocks];
-  if constexpr (W == 0) {
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; ++m) {
-      x0[m] = 0;
-      x1[m] = 0;
-    }
-  } else {
-    auto const addr     = reinterpret_cast<uintptr_t>(q);
-    auto const* const w = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3});
-    uint32_t const bit0 = static_cast<uint32_t>(addr % 4) * byte_bits + 2 * lane * W;
-    uint32_t lo[mini_blocks];
-    uint32_t hi[mini_blocks];
-    // Mini-block m starts 64 * W bits (2W words) after the previous one, at the same bit offset.
-    uint32_t const shift = bit0 % 32;
-    bool const spans     = shift + 2 * W > 32;
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; ++m) {
-      auto const* const ptr = w + bit0 / 32 + m * 2 * W;
-      lo[m]                 = __ldg(ptr);
-      hi[m]                 = spans ? __ldg(ptr + 1) : 0u;
-    }
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; ++m) {
-      uint32_t const pair = __funnelshift_r(lo[m], hi[m], shift);
-      x0[m]               = pair & mask;
-      x1[m]               = (pair >> W) & mask;
-    }
-  }
-  uint32_t sums[mini_blocks];
-#pragma unroll
-  for (uint32_t m = 0; m < mini_blocks; ++m) {
-    sums[m] = x0[m] + x1[m];
-  }
-  uint32_t inclusive[mini_blocks];
-  uint32_t total[mini_blocks];
-  // A mini-block's 64 values sum to at most 64 * (2^W - 1), below 2^16 up to W = 10.
-  if constexpr (64 * ((uint64_t{1} << W) - 1) < (uint64_t{1} << 16)) {
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; m += 2) {
-      uint32_t const packed = inclusive_sum32(sums[m] | (sums[m + 1] << 16));
-      uint32_t const all    = __shfl_sync(0xffff'ffffu, packed, warp_lanes - 1);
-      inclusive[m]          = packed & 0xffffu;
-      inclusive[m + 1]      = packed >> 16;
-      total[m]              = all & 0xffffu;
-      total[m + 1]          = all >> 16;
-    }
-  } else {
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; ++m) {
-      inclusive[m] = inclusive_sum32(sums[m]);
-      total[m]     = __shfl_sync(0xffff'ffffu, inclusive[m], warp_lanes - 1);
-    }
-  }
-  acc_t const lane_min_delta = static_cast<acc_t>(2 * lane) * min_delta;
-  acc_t const mb_min_delta   = static_cast<acc_t>(2 * warp_lanes) * min_delta;
-  // The output column is in global memory; this selects global stores.
-  __builtin_assume(__isGlobal(out));
-  bool const aligned = (reinterpret_cast<uintptr_t>(out) & (2 * Width - 1)) == 0;
-#pragma unroll
-  for (uint32_t m = 0; m < mini_blocks; ++m) {
-    acc_t const v0 =
-      carry + lane_min_delta + static_cast<acc_t>(inclusive[m] - sums[m] + x0[m]) + min_delta;
-    acc_t const v1 = v0 + min_delta + static_cast<acc_t>(x1[m]);
-    carry += static_cast<acc_t>(total[m]) + mb_min_delta;
-    auto* const dst = out + (m * 2 * warp_lanes + 2 * lane) * Width;
-    if constexpr (Width == 8) {
-      if (aligned) {
-        __stcs(reinterpret_cast<longlong2*>(dst),
-               make_longlong2(static_cast<long long>(v0), static_cast<long long>(v1)));
-      } else {
-        __stcs(reinterpret_cast<long long*>(dst), static_cast<long long>(v0));
-        __stcs(reinterpret_cast<long long*>(dst) + 1, static_cast<long long>(v1));
-      }
-    } else {
-      if (aligned) {
-        __stcs(reinterpret_cast<int2*>(dst), make_int2(static_cast<int>(v0), static_cast<int>(v1)));
-      } else {
-        __stcs(reinterpret_cast<int*>(dst), static_cast<int>(v0));
-        __stcs(reinterpret_cast<int*>(dst) + 1, static_cast<int>(v1));
-      }
-    }
-  }
-}
-
 #define CUDF_NZ_DELTA_WIDTH_CASE(n) \
   case n: f.template operator()<n>(); break;
 
@@ -1323,11 +1219,11 @@ struct rank_map_output {
     // into L2.
     __builtin_assume(__isGlobal(out));
     if constexpr (Width == 8) {
-      *reinterpret_cast<long long*>(out)                      = static_cast<long long>(a);
-      *reinterpret_cast<long long*>(out + warp_lanes * Width) = static_cast<long long>(b);
+      __stcs(reinterpret_cast<long long*>(out), static_cast<long long>(a));
+      __stcs(reinterpret_cast<long long*>(out + warp_lanes * Width), static_cast<long long>(b));
     } else if constexpr (Width == 4) {
-      *reinterpret_cast<int*>(out)                      = static_cast<int>(a);
-      *reinterpret_cast<int*>(out + warp_lanes * Width) = static_cast<int>(b);
+      __stcs(reinterpret_cast<int*>(out), static_cast<int>(a));
+      __stcs(reinterpret_cast<int*>(out + warp_lanes * Width), static_cast<int>(b));
     } else {
       store_value<Width>(out, dtype_len, a);
       store_value<Width>(out + warp_lanes * width(), dtype_len, b);
@@ -1645,29 +1541,16 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
               uint8_t const* block_next      = next;
               acc_t block_lane_min_delta     = lane_min_delta;
               acc_t block_pass_min_delta     = pass_min_delta;
-              acc_t block_min_delta          = min_delta;
               constexpr uint32_t touch_blocks =
                 cuda::std::max(1u, (warp_lanes * 32) / (block_bytes + 8));
               uint32_t touch_countdown = 1;
               while (true) {
-                if constexpr (W <= max_pair_width) {
-                  // Two consecutive values per lane
-                  decode_pairs_uniform<W, Width, acc_t>(
-                    block_q,
-                    lane,
-                    block_min_delta,
-                    carry,
-                    output.address(static_cast<int32_t>(position)));
-                  out += block_values * Width;
-                  position += block_values;
-                } else {
-                  decode_uniform_block64<W, acc_t>(block_q,
-                                                   lane,
-                                                   block_lane_min_delta,
-                                                   block_pass_min_delta,
-                                                   carry,
-                                                   place_values);
-                }
+                decode_uniform_block64<W, acc_t>(block_q,
+                                                 lane,
+                                                 block_lane_min_delta,
+                                                 block_pass_min_delta,
+                                                 carry,
+                                                 place_values);
                 p = block_next;
                 if (position + block_values > value_limit) { return; }
                 auto const at2      = reinterpret_cast<uintptr_t>(p);
@@ -1742,7 +1625,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                   }
                 }
                 auto const min_delta2 = static_cast<acc_t>(zigzag_decode(v2));
-                block_min_delta       = min_delta2;
                 block_lane_min_delta  = static_cast<acc_t>(lane + 1) * min_delta2;
                 block_pass_min_delta  = static_cast<acc_t>(warp_lanes) * min_delta2;
               }
