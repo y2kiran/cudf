@@ -1219,20 +1219,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     }
   };
 
-  // Page data is also moved from L2 into L1 ahead of the read position, in bursts of eight lines.
-  constexpr uint32_t l1_window = 8 * cache_line_bytes;
-  uintptr_t l1_prefetched      = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
-  auto l1_prefetch             = [&](uintptr_t cursor) {
-    if (cursor + l1_window > l1_prefetched) {
-      l1_prefetched = cuda::std::max(l1_prefetched, cursor & ~uintptr_t{cache_line_bytes - 1});
-      auto const line = l1_prefetched + lane * cache_line_bytes;
-      if (lane < l1_window / cache_line_bytes && line < page_end) {
-        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
-      }
-      l1_prefetched += l1_window;
-    }
-  };
-
   bool error = false;
   if (position < value_limit) { prefetch_burst(); }
   while (position < value_limit) {
@@ -1377,7 +1363,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         prefetched < page_end) {
       prefetch_burst();
     }
-    l1_prefetch(reinterpret_cast<uintptr_t>(mb_start));
 
     auto const min_delta = static_cast<acc_t>(min_delta_bits);
     // `min_delta` contributions of a lane's value and of a whole pass
