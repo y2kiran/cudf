@@ -1081,20 +1081,23 @@ enum class page_processing_stage {
  * @param[in] num_rows Maximum number of rows to read
  * @param[in] filter Filtering function used to decide which pages to operate on
  * @param[in] stage What stage of the decoding process is this being called from
+ * @param[in] group The threads that set up this page together: by default the whole block, or a
+ * tile when several pages share a block
  * @tparam Filter Function that takes a PageInfo reference and returns true if the given page should
  * be operated on Currently only used by compute_page_sizes_kernel step)
  * @return True if this page should be processed further
  */
-template <typename Filter>
+template <typename Filter, typename Group = cooperative_groups::thread_block>
 inline __device__ bool setup_local_page_info(auto* const s,
                                              PageInfo const* p,
                                              device_span<ColumnChunkDesc const> chunks,
                                              size_t min_row,
                                              size_t num_rows,
                                              Filter filter,
-                                             page_processing_stage stage)
+                                             page_processing_stage stage,
+                                             Group const& group = cooperative_groups::this_thread_block())
 {
-  int t = threadIdx.x;
+  int t = static_cast<int>(group.thread_rank());
 
   // Fetch page info: the threads copy the page and chunk descriptors together, word by word.
   {
@@ -1108,7 +1111,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
       auto* const to         = reinterpret_cast<uint32_t*>(&dst);
       auto const* const from = reinterpret_cast<uint32_t const*>(&src);
       for (int i = t; i < static_cast<int>(sizeof(dst) / sizeof(uint32_t));
-           i += static_cast<int>(blockDim.x)) {
+           i += static_cast<int>(group.size())) {
         to[i] = from[i];
       }
     };
@@ -1118,7 +1121,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
       if (!t) { s->nesting.nesting_info = nullptr; }
     }
   }
-  __syncthreads();
+  group.sync();
 
   // return false if this is a dictionary page or it does not pass the filter condition
   if ((s->setup.page.flags & PAGEINFO_FLAGS_DICTIONARY) != 0 || !filter(s->setup.page)) {
@@ -1144,7 +1147,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
                                    : end_row - (page_start_row + s->setup.first_row);
     }
   }
-  __syncthreads();
+  group.sync();
 
   // if we can use the nesting decode cache, set it up now
   if constexpr (requires { s->nesting; }) {
@@ -1165,7 +1168,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
           s->nesting.nesting_decode_cache[thread_depth].end_depth =
             s->setup.page.nesting_decode[thread_depth].end_depth;
         }
-        depth += blockDim.x;
+        depth += static_cast<int>(group.size());
       }
     }
 
@@ -1173,7 +1176,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
       s->nesting.nesting_info =
         can_use_decode_cache ? s->nesting.nesting_decode_cache : s->setup.page.nesting_decode;
     }
-    __syncthreads();
+    group.sync();
 
     // zero counts
     int depth = 0;
@@ -1184,9 +1187,9 @@ inline __device__ bool setup_local_page_info(auto* const s,
         s->nesting.nesting_info[thread_depth].value_count = 0;
         s->nesting.nesting_info[thread_depth].null_count  = 0;
       }
-      depth += blockDim.x;
+      depth += static_cast<int>(group.size());
     }
-    __syncthreads();
+    group.sync();
   }
 
   // if we have no work to do (eg, in a skip_rows/num_rows case) in this page.
@@ -1482,7 +1485,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
 
     __threadfence_block();
   }
-  __syncthreads();
+  group.sync();
 
   return true;
 }
