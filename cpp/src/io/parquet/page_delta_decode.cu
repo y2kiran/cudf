@@ -1092,7 +1092,7 @@ __device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
  * Lane `i` holds values 2i and 2i + 1 of each mini-block, 2W adjacent bits, so its 16-byte stores
  * (8-byte for 32-bit outputs) sit next to its neighbors' and each store instruction covers a
  * contiguous range. One scan of the lanes' pair sums per mini-block gives their starts; two
- * mini-blocks share a scan of 16-bit fields up to `max_paired_width`.
+ * mini-blocks share a scan of 16-bit fields when their sums fit (W <= 10).
  */
 template <uint32_t W, uint32_t Width, typename acc_t>
 __device__ __forceinline__ void decode_pairs_uniform(
@@ -1137,7 +1137,8 @@ __device__ __forceinline__ void decode_pairs_uniform(
   }
   uint32_t inclusive[mini_blocks];
   uint32_t total[mini_blocks];
-  if constexpr (W <= max_paired_width) {
+  // A mini-block's 64 values sum to at most 64 * (2^W - 1), below 2^16 up to W = 10.
+  if constexpr (64 * ((uint64_t{1} << W) - 1) < (uint64_t{1} << 16)) {
 #pragma unroll
     for (uint32_t m = 0; m < mini_blocks; m += 2) {
       uint32_t const packed = inclusive_sum32(sums[m] | (sums[m + 1] << 16));
