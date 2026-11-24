@@ -1091,8 +1091,8 @@ __device__ __forceinline__ void decode_mixed_block32(uint8_t const* q,
  *
  * Lane `i` holds values 8i to 8i + 7, which lie in one mini-block and occupy one run of 8W bits,
  * so the lane loads a few words and unpacks its values at compile-time offsets. One warp scan of
- * the lanes' sums gives each lane's start; the lane then accumulates its eight values and stores
- * them contiguously, in 16-byte stores when `out` allows it.
+ * the lanes' sums gives each lane's start; the lane then accumulates its eight values and stages
+ * them through shared memory, so the warp's stores stay contiguous.
  */
 template <uint32_t W, uint32_t Width, typename acc_t>
 __device__ __forceinline__ void decode_blocked_uniform(
@@ -1151,41 +1151,27 @@ __device__ __forceinline__ void decode_blocked_uniform(
   }
   carry += static_cast<acc_t>(total) + static_cast<acc_t>(items * warp_lanes) * min_delta;
 
-  auto* const dst = out + lane * items * Width;
+  // Transpose through shared memory so the stores stay lane-striped and contiguous: value g of the
+  // block is staged at slot g ^ ((g >> 3) & 7), which spreads each store phase over the banks.
+  __shared__ acc_t staged[items * warp_lanes];
+#pragma unroll
+  for (uint32_t j = 0; j < items; ++j) {
+    staged[items * lane + (j ^ (lane & 7))] = values[j];
+  }
+  __syncwarp();
   // The output column is in global memory; this selects global stores.
-  __builtin_assume(__isGlobal(dst));
-  bool const aligned = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
-  if constexpr (Width == 8) {
-    if (aligned) {
+  __builtin_assume(__isGlobal(out));
 #pragma unroll
-      for (uint32_t k = 0; k < items / 2; ++k) {
-        __stcs(reinterpret_cast<longlong2*>(dst) + k,
-               make_longlong2(static_cast<long long>(values[2 * k]),
-                              static_cast<long long>(values[2 * k + 1])));
-      }
+  for (uint32_t m = 0; m < items; ++m) {
+    uint32_t const g = m * warp_lanes + lane;
+    acc_t const v    = staged[g ^ ((g >> 3) & 7)];
+    if constexpr (Width == 8) {
+      __stcs(reinterpret_cast<long long*>(out) + g, static_cast<long long>(v));
     } else {
-#pragma unroll
-      for (uint32_t j = 0; j < items; ++j) {
-        __stcs(reinterpret_cast<long long*>(dst) + j, static_cast<long long>(values[j]));
-      }
-    }
-  } else {
-    if (aligned) {
-#pragma unroll
-      for (uint32_t k = 0; k < items / 4; ++k) {
-        __stcs(reinterpret_cast<int4*>(dst) + k,
-               make_int4(static_cast<int>(values[4 * k]),
-                         static_cast<int>(values[4 * k + 1]),
-                         static_cast<int>(values[4 * k + 2]),
-                         static_cast<int>(values[4 * k + 3])));
-      }
-    } else {
-#pragma unroll
-      for (uint32_t j = 0; j < items; ++j) {
-        __stcs(reinterpret_cast<int*>(dst) + j, static_cast<int>(values[j]));
-      }
+      __stcs(reinterpret_cast<int*>(out) + g, static_cast<int>(v));
     }
   }
+  __syncwarp();
 }
 
 #define CUDF_NZ_DELTA_WIDTH_CASE(n) \
