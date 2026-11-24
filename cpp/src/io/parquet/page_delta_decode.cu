@@ -882,6 +882,59 @@ __device__ __forceinline__ void sum_split8(uint32_t const (&x)[8],
 }
 
 /**
+ * @brief Reconstructs eight consecutive passes from their normalized deltas `x`, all at most
+ * `max_width` bits wide (for 64-bit outputs at most `max_split_width`), and advances `carry` past
+ * them; `place` receives the passes in pairs. Narrow passes share scans: three per scan of 10-bit
+ * fields up to `max_tripled_width`, two of 16-bit fields up to `max_paired_width`.
+ */
+template <typename acc_t, typename Place>
+__device__ __forceinline__ void sum8(uint32_t const (&x)[8],
+                                     uint32_t max_width,
+                                     acc_t lane_min_delta,
+                                     acc_t pass_min_delta,
+                                     acc_t& carry,
+                                     Place&& place)
+{
+  constexpr uint32_t passes = 8;
+  if (sizeof(acc_t) == sizeof(uint64_t) and max_width > max_narrow_width) {
+    sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
+  } else if (max_width != 0 and max_width <= max_tripled_width) {
+    constexpr uint32_t field_bits = 10;
+    constexpr uint32_t field_mask = (1u << field_bits) - 1;
+    constexpr uint32_t groups     = (passes + 2) / 3;
+    uint32_t sums[groups];
+    uint32_t all[groups];
+#pragma unroll
+    for (uint32_t g = 0; g < groups; ++g) {
+      uint32_t fields = 0;
+#pragma unroll
+      for (uint32_t j = 0; j < 3 and 3 * g + j < passes; ++j) {
+        fields |= x[3 * g + j] << (field_bits * j);
+      }
+      sums[g] = inclusive_sum32(fields);
+      all[g]  = __shfl_sync(0xffff'ffffu, sums[g], warp_lanes - 1);
+    }
+    acc_t v[passes];
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      uint32_t const field = field_bits * (k % 3);
+      v[k] = carry + lane_min_delta + static_cast<acc_t>((sums[k / 3] >> field) & field_mask);
+      carry += static_cast<acc_t>((all[k / 3] >> field) & field_mask) + pass_min_delta;
+      if (k % 2 == 1) { place(v[k - 1], v[k]); }
+    }
+  } else {
+#pragma unroll
+    for (uint32_t m = 0; m < passes / 2; ++m) {
+      acc_t va;
+      acc_t vb;
+      sum_pair<acc_t>(
+        x[2 * m], x[2 * m + 1], max_width, lane_min_delta, pass_min_delta, carry, va, vb);
+      place(va, vb);
+    }
+  }
+}
+
+/**
  * @brief Decodes a block of four 64-value mini-blocks that all have the compile-time width `W`.
  *
  * Every pass starts a whole number of words after the first, at the same bit offset, so the lane
@@ -922,42 +975,7 @@ __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
       x[k] = __funnelshift_r(lo[k], hi[k], shift) & mask;
     }
   }
-  if constexpr (sizeof(acc_t) == sizeof(uint64_t) and W > max_narrow_width) {
-    sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
-  } else if constexpr (W != 0 and W <= max_tripled_width) {
-    // Three passes share one scan of 10-bit fields.
-    constexpr uint32_t field_bits = 10;
-    constexpr uint32_t field_mask = (1u << field_bits) - 1;
-    constexpr uint32_t groups     = (passes + 2) / 3;
-    uint32_t sums[groups];
-    uint32_t all[groups];
-#pragma unroll
-    for (uint32_t g = 0; g < groups; ++g) {
-      uint32_t fields = 0;
-#pragma unroll
-      for (uint32_t j = 0; j < 3 and 3 * g + j < passes; ++j) {
-        fields |= x[3 * g + j] << (field_bits * j);
-      }
-      sums[g] = inclusive_sum32(fields);
-      all[g]  = __shfl_sync(0xffff'ffffu, sums[g], warp_lanes - 1);
-    }
-    acc_t v[passes];
-#pragma unroll
-    for (uint32_t k = 0; k < passes; ++k) {
-      uint32_t const field = field_bits * (k % 3);
-      v[k] = carry + lane_min_delta + static_cast<acc_t>((sums[k / 3] >> field) & field_mask);
-      carry += static_cast<acc_t>((all[k / 3] >> field) & field_mask) + pass_min_delta;
-      if (k % 2 == 1) { place(v[k - 1], v[k]); }
-    }
-  } else {
-#pragma unroll
-    for (uint32_t m = 0; m < passes / 2; ++m) {
-      acc_t va;
-      acc_t vb;
-      sum_pair<acc_t>(x[2 * m], x[2 * m + 1], W, lane_min_delta, pass_min_delta, carry, va, vb);
-      place(va, vb);
-    }
-  }
+  sum8<acc_t>(x, W, lane_min_delta, pass_min_delta, carry, place);
 }
 
 /**
@@ -1000,38 +1018,15 @@ __device__ __forceinline__ void decode_mixed_block64(uint8_t const* q,
     // The next mini-block starts 64 * w bits later.
     bit += 2 * warp_lanes * w;
   }
-  if constexpr (sizeof(acc_t) == sizeof(uint64_t)) {
-    uint32_t max_width = 0;
-#pragma unroll
-    for (uint32_t m = 0; m < mini_blocks; ++m) {
-      max_width = cuda::std::max(max_width, (widths >> (byte_bits * m)) & 0xffu);
-    }
-    if (max_width > max_narrow_width) {
-      uint32_t x[2 * mini_blocks];
-#pragma unroll
-      for (uint32_t k = 0; k < 2 * mini_blocks; ++k) {
-        x[k] = __funnelshift_r(lo[k], hi[k], shift[k / 2]) & mask[k / 2];
-      }
-      sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
-      return;
-    }
-  }
+  uint32_t max_width = 0;
+  uint32_t x[2 * mini_blocks];
 #pragma unroll
   for (uint32_t m = 0; m < mini_blocks; ++m) {
-    uint32_t const xa = __funnelshift_r(lo[2 * m], hi[2 * m], shift[m]) & mask[m];
-    uint32_t const xb = __funnelshift_r(lo[2 * m + 1], hi[2 * m + 1], shift[m]) & mask[m];
-    acc_t va;
-    acc_t vb;
-    sum_pair<acc_t>(xa,
-                    xb,
-                    (widths >> (byte_bits * m)) & 0xffu,
-                    lane_min_delta,
-                    pass_min_delta,
-                    carry,
-                    va,
-                    vb);
-    place(va, vb);
+    max_width = cuda::std::max(max_width, (widths >> (byte_bits * m)) & 0xffu);
+    x[2 * m]     = __funnelshift_r(lo[2 * m], hi[2 * m], shift[m]) & mask[m];
+    x[2 * m + 1] = __funnelshift_r(lo[2 * m + 1], hi[2 * m + 1], shift[m]) & mask[m];
   }
+  sum8<acc_t>(x, max_width, lane_min_delta, pass_min_delta, carry, place);
 }
 
 /**
