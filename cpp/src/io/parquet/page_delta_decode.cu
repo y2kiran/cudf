@@ -597,6 +597,9 @@ static_assert(prefetch_window % (cache_line_bytes * warp_lanes) == 0,
 // The 32 normalized deltas of a pass at this width or below sum below 2^16 (32 * 2047 < 65536), so
 // two passes share one 32-bit scan
 constexpr uint32_t max_paired_width = 11;
+// The 32 normalized deltas of a pass at this width or below sum below 2^10 (32 * 31 < 1024), so
+// three passes share one 32-bit scan
+constexpr uint32_t max_tripled_width = 5;
 // The 32 normalized deltas of a pass at this width or below sum below 2^32
 constexpr uint32_t max_narrow_width = 27;
 // Up to this width, a 64-bit pass splits each delta at bit `max_narrow_width`: the low parts sum
@@ -921,6 +924,31 @@ __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
   }
   if constexpr (sizeof(acc_t) == sizeof(uint64_t) and W > max_narrow_width) {
     sum_split8<acc_t>(x, lane_min_delta, pass_min_delta, carry, place);
+  } else if constexpr (W != 0 and W <= max_tripled_width) {
+    // Three passes share one scan of 10-bit fields.
+    constexpr uint32_t field_bits = 10;
+    constexpr uint32_t field_mask = (1u << field_bits) - 1;
+    constexpr uint32_t groups     = (passes + 2) / 3;
+    uint32_t sums[groups];
+    uint32_t all[groups];
+#pragma unroll
+    for (uint32_t g = 0; g < groups; ++g) {
+      uint32_t fields = 0;
+#pragma unroll
+      for (uint32_t j = 0; j < 3 and 3 * g + j < passes; ++j) {
+        fields |= x[3 * g + j] << (field_bits * j);
+      }
+      sums[g] = inclusive_sum32(fields);
+      all[g]  = __shfl_sync(0xffff'ffffu, sums[g], warp_lanes - 1);
+    }
+    acc_t v[passes];
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      uint32_t const field = field_bits * (k % 3);
+      v[k] = carry + lane_min_delta + static_cast<acc_t>((sums[k / 3] >> field) & field_mask);
+      carry += static_cast<acc_t>((all[k / 3] >> field) & field_mask) + pass_min_delta;
+      if (k % 2 == 1) { place(v[k - 1], v[k]); }
+    }
   } else {
 #pragma unroll
     for (uint32_t m = 0; m < passes / 2; ++m) {
