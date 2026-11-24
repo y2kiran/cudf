@@ -1333,19 +1333,47 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
           next_step += steady_step;
         }
         auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
-        uint64_t const window =
-          extract64(__ldg(src), __ldg(src + 1), static_cast<uint32_t>(at - aligned) * byte_bits);
-        uint32_t const stop = ~static_cast<uint32_t>(window) & 0x8080'8080u;
-        if (stop == 0) { break; }
-        // The lowest stop bit is bit 8 * len - 1.
-        auto const len = static_cast<uint32_t>(__ffs(static_cast<int>(stop))) / byte_bits;
-        uint32_t const x =
-          static_cast<uint32_t>(window) & (len < 4 ? (1u << (byte_bits * len)) - 1 : ~0u);
-        // Gather the seven-bit groups of the varint.
-        uint64_t const v = (x & 0x7fu) | ((x >> 1) & 0x3f80u) | ((x >> 2) & 0x1f'c000u) |
-                           ((x >> 3) & 0xfe0'0000u);
-        auto const widths = static_cast<uint32_t>(window >> (byte_bits * len)) &
-                            (mb_count < 4 ? (1u << (byte_bits * mb_count)) - 1 : ~0u);
+        auto const shift      = static_cast<uint32_t>(at - aligned) * byte_bits;
+        uint64_t const w1     = __ldg(src + 1);
+        uint64_t const window = extract64(__ldg(src), w1, shift);
+        uint32_t const stop   = ~static_cast<uint32_t>(window) & 0x8080'8080u;
+        uint32_t len;
+        uint64_t v;
+        uint32_t widths;
+        if (stop != 0) {
+          // A minimum delta of at most four bytes: the lowest stop bit is bit 8 * len - 1.
+          len              = static_cast<uint32_t>(__ffs(static_cast<int>(stop))) / byte_bits;
+          uint32_t const x =
+            static_cast<uint32_t>(window) & (len < 4 ? (1u << (byte_bits * len)) - 1 : ~0u);
+          // Gather the seven-bit groups of the varint.
+          v = (x & 0x7fu) | ((x >> 1) & 0x3f80u) | ((x >> 2) & 0x1f'c000u) |
+              ((x >> 3) & 0xfe0'0000u);
+          widths = static_cast<uint32_t>(window >> (byte_bits * len));
+        } else {
+          // A longer minimum delta: decode up to ten bytes from 16 bytes of header.
+          if (aligned + 3 * word_bytes > page_end) { break; }
+          uint64_t const hi                    = extract64(w1, __ldg(src + 2), shift);
+          constexpr uint64_t continuation_bits = 0x8080'8080'8080'8080ull;
+          uint64_t const stop_lo               = ~window & continuation_bits;
+          uint64_t const stop_hi               = ~hi & continuation_bits;
+          len = stop_lo != 0 ? stop_byte_count(stop_lo)
+                             : (stop_hi != 0 ? word_bytes + stop_byte_count(stop_hi)
+                                             : header_bytes + 1);
+          if (len > max_varint_bytes) { break; }
+          v = 0;
+#pragma unroll
+          for (uint32_t i = 0; i < max_varint_bytes; ++i) {
+            uint64_t const byte =
+              (i < word_bytes ? window >> (byte_bits * i) : hi >> (byte_bits * (i - word_bytes))) &
+              0x7f;
+            if (i < len) { v |= byte << (7 * i); }
+          }
+          // len + mb_count <= 14, so the widths lie within the 16 bytes.
+          widths = static_cast<uint32_t>(
+            len < word_bytes ? (window >> (byte_bits * len)) | (hi << (word_bits - byte_bits * len))
+                             : hi >> (byte_bits * (len - word_bytes)));
+        }
+        widths &= mb_count < 4 ? (1u << (byte_bits * mb_count)) - 1 : ~0u;
         uint32_t const width_sum = __dp4a(widths, bytes_one, 0u);
         // A byte above `limit` has its top bit set, or sets it when `127 - limit` is added to its
         // low seven bits, without carrying into the next byte.
