@@ -712,6 +712,93 @@ __device__ __forceinline__ uint64_t unpack64(uint8_t const* q, uint32_t w, uint3
 }
 
 /**
+ * @brief A lane's view of one mini-block packed at a runtime width: its aligned word base, the bit
+ * offset of its value in the first pass, and the value mask.
+ */
+struct lane_bits {
+  uint32_t const* base;
+  uint32_t bit;
+  uint32_t width;
+  uint32_t mask;
+
+  __device__ __forceinline__ lane_bits(uint8_t const* q, uint32_t w, uint32_t lane)
+    : base(reinterpret_cast<uint32_t const*>(reinterpret_cast<uintptr_t>(q) & ~uintptr_t{3})),
+      bit(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) % 4) * byte_bits + lane * w),
+      width(w),
+      mask(w < 32 ? (1u << w) - 1 : ~0u)
+  {
+  }
+
+  /**
+   * @brief Low 32 bits of this lane's value `extra` bits past its first-pass value.
+   */
+  [[nodiscard]] __device__ __forceinline__ uint32_t get(uint32_t extra) const
+  {
+    uint32_t const at    = bit + extra;
+    auto const* const w  = base + at / 32;
+    uint32_t const shift = at % 32;
+    uint32_t const lo    = __ldg(w);
+    uint32_t const hi    = shift + width > 32 ? __ldg(w + 1) : 0u;
+    return __funnelshift_r(lo, hi, shift) & mask;
+  }
+};
+
+/**
+ * @brief Reconstructs two consecutive passes from their normalized deltas `xa` and `xb` (the low
+ * 32 bits for 32-bit outputs), both at most `max_width` bits wide, and advances `carry` past them.
+ *
+ * Passes up to `max_paired_width` share one scan. 64-bit passes above `max_narrow_width`, which must
+ * be at most `max_split_width`, add one shared scan of their high bits.
+ */
+template <typename acc_t>
+__device__ __forceinline__ void sum_pair(uint32_t xa,
+                                         uint32_t xb,
+                                         uint32_t max_width,
+                                         acc_t lane_min_delta,
+                                         acc_t pass_min_delta,
+                                         acc_t& carry,
+                                         acc_t& va,
+                                         acc_t& vb)
+{
+  constexpr bool wide = sizeof(acc_t) == sizeof(uint64_t);
+  if (max_width <= max_paired_width) {
+    uint32_t const sums = inclusive_sum32(xa | (xb << 16));
+    uint32_t const all  = __shfl_sync(0xffff'ffffu, sums, warp_lanes - 1);
+    va                  = carry + lane_min_delta + static_cast<acc_t>(sums & 0xffffu);
+    carry += static_cast<acc_t>(all & 0xffffu) + pass_min_delta;
+    vb = carry + lane_min_delta + static_cast<acc_t>(sums >> 16);
+    carry += static_cast<acc_t>(all >> 16) + pass_min_delta;
+  } else if (not wide or max_width <= max_narrow_width) {
+    uint32_t const sa = inclusive_sum32(xa);
+    uint32_t const sb = inclusive_sum32(xb);
+    uint32_t const ta = __shfl_sync(0xffff'ffffu, sa, warp_lanes - 1);
+    uint32_t const tb = __shfl_sync(0xffff'ffffu, sb, warp_lanes - 1);
+    va                = carry + lane_min_delta + static_cast<acc_t>(sa);
+    carry += static_cast<acc_t>(ta) + pass_min_delta;
+    vb = carry + lane_min_delta + static_cast<acc_t>(sb);
+    carry += static_cast<acc_t>(tb) + pass_min_delta;
+  } else {
+    // sum(x) = sum(low) + 2^27 * sum(high), where sum(low) < 2^32 is the 32-bit sum of x less
+    // 2^27 * sum(high), modulo 2^32.
+    uint32_t const highs = (xa >> max_narrow_width) | ((xb >> max_narrow_width) << byte_bits);
+    uint32_t const hs    = inclusive_sum32(highs);
+    uint32_t const sa    = inclusive_sum32(xa);
+    uint32_t const sb    = inclusive_sum32(xb);
+    uint32_t const ht    = __shfl_sync(0xffff'ffffu, hs, warp_lanes - 1);
+    uint32_t const ta    = __shfl_sync(0xffff'ffffu, sa, warp_lanes - 1);
+    uint32_t const tb    = __shfl_sync(0xffff'ffffu, sb, warp_lanes - 1);
+    auto widen           = [](uint32_t sum, uint32_t high) {
+      return static_cast<acc_t>(static_cast<uint64_t>(sum - (high << max_narrow_width)) +
+                                (static_cast<uint64_t>(high) << max_narrow_width));
+    };
+    va = carry + lane_min_delta + widen(sa, hs & 0xffu);
+    carry += widen(ta, ht & 0xffu) + pass_min_delta;
+    vb = carry + lane_min_delta + widen(sb, (hs >> byte_bits) & 0xffu);
+    carry += widen(tb, (ht >> byte_bits) & 0xffu) + pass_min_delta;
+  }
+}
+
+/**
  * @brief Stores the low `Width` bytes of `value` at `dst`; a `Width` of 0 takes the width from
  * `dtype_len` at run time.
  */
@@ -955,9 +1042,11 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       if (from_staged) {
         auto const aligned = aligned_word(p);
         uint64_t w[header_words];
+        bool const near_end = aligned + word_bytes * header_words > page_end;
 #pragma unroll
         for (uint32_t i = 0; i < header_words; ++i) {
-          w[i] = clear_past_end(staged[i], aligned + word_bytes * i, page_end);
+          w[i] = near_end ? clear_past_end(staged[i], aligned + word_bytes * i, page_end)
+                          : staged[i];
         }
         // The `header_bytes` bytes starting at p; bytes past the end of the page read as zero,
         // like the bounded byte loads of the fallback.
@@ -976,13 +1065,16 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       bool const fits = from_staged && mb_count <= max_packed_widths && len <= max_varint_bytes &&
                         len + mb_count <= header_bytes;
       if (fits) {
-        uint64_t v = 0;
+        // Usually a one-byte minimum delta
+        uint64_t v = lo & 0x7f;
+        if (len > 1) {
 #pragma unroll
-        for (uint32_t i = 0; i < max_varint_bytes; ++i) {
-          uint64_t const byte =
-            (i < word_bytes ? lo >> (byte_bits * i) : hi >> (byte_bits * (i - word_bytes))) &
-            0x7f;
-          if (i < len) { v |= byte << (7 * i); }
+          for (uint32_t i = 1; i < max_varint_bytes; ++i) {
+            uint64_t const byte =
+              (i < word_bytes ? lo >> (byte_bits * i) : hi >> (byte_bits * (i - word_bytes))) &
+              0x7f;
+            if (i < len) { v |= byte << (7 * i); }
+          }
         }
         min_delta_bits = static_cast<uint64_t>(zigzag_decode(v));
         // The bit widths are the bytes following the varint; 1 <= len <= 10.
@@ -1012,13 +1104,20 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       cuda::std::min(block_passes, (value_limit - position + warp_lanes - 1) / warp_lanes);
     // Locate the following block and start loading its header when more values follow.
     uint8_t const* next_block = nullptr;
+    uint32_t width_sum        = 0;
+    uint32_t width_max        = 0;
+    if (packed) {
+      // Byte-wise sums and maxima of the packed widths
+      auto const widths_lo = static_cast<uint32_t>(packed_widths);
+      auto const widths_hi = static_cast<uint32_t>(packed_widths >> 32);
+      width_sum            = __dp4a(widths_hi, 0x0101'0101u, __dp4a(widths_lo, 0x0101'0101u, 0u));
+      width_max            = __vmaxu4(widths_lo, widths_hi);
+      width_max            = __vmaxu4(width_max, width_max >> 16);
+      width_max            = __vmaxu4(width_max, width_max >> 8) & 0xffu;
+    }
+    bool const whole_block = position + block_size <= value_limit;
     if (position + block_size < value_limit) {
-      uint32_t width_sum = 0;
-      if (packed) {
-        // Byte-wise sums of the two halves of the packed widths
-        width_sum = __dp4a(static_cast<uint32_t>(packed_widths), 0x0101'0101u, 0u);
-        width_sum = __dp4a(static_cast<uint32_t>(packed_widths >> 32), 0x0101'0101u, width_sum);
-      } else {
+      if (not packed) {
         for (uint32_t m = 0; m < mb_count; ++m) {
           width_sum += width_of(m);
         }
@@ -1026,21 +1125,69 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       next_block = mb_start + static_cast<size_t>(mb_bytes_per_bit) * width_sum;
       if (next_block >= mb_start && next_block < end) { stage(next_block); }
     }
+    if (reinterpret_cast<uintptr_t>(mb_start) + prefetch_window / 2 > prefetched &&
+        prefetched < page_end) {
+      prefetch_burst();
+    }
 
     auto const min_delta = static_cast<acc_t>(min_delta_bits);
     // `min_delta` contributions of a lane's value and of a whole pass
     acc_t const lane_min_delta = static_cast<acc_t>(lane + 1) * min_delta;
     acc_t const pass_min_delta = static_cast<acc_t>(warp_lanes) * min_delta;
 
+    // A whole block of 32- or 64-value mini-blocks whose packed values all lie within the page is
+    // decoded two passes at a time with no per-pass checks: the two halves of one 64-value
+    // mini-block, or two 32-value mini-blocks.
+    if (packed and whole_block and passes_per_mb <= 2 and block_passes % 2 == 0 and
+        width_max <= (wide ? max_split_width : word_bits) and
+        reinterpret_cast<uintptr_t>(mb_start) + static_cast<size_t>(mb_bytes_per_bit) * width_sum <=
+          page_end) {
+      uint32_t const mb_shift = passes_per_mb - 1;
+      bool const direct       = not Mapped and static_cast<int32_t>(position) >= output.first_row;
+      uint8_t const* q        = mb_start;
+      for (uint32_t k = 0; k < block_passes; k += 2) {
+        auto const wa =
+          static_cast<uint32_t>(packed_widths >> (byte_bits * (k >> mb_shift))) & 0xffu;
+        auto const wb =
+          static_cast<uint32_t>(packed_widths >> (byte_bits * ((k + 1) >> mb_shift))) & 0xffu;
+        int32_t const row_a = output.load_row(position + lane, value_limit);
+        int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
+        uint32_t xa         = 0;
+        uint32_t xb         = 0;
+        if (mb_shift != 0) {
+          if (wa != 0) {
+            lane_bits const bits{q, wa, lane};
+            xa = bits.get(0);
+            xb = bits.get(warp_lanes * wa);
+          }
+        } else {
+          if (wa != 0) { xa = lane_bits{q, wa, lane}.get(0); }
+          if (wb != 0) { xb = lane_bits{q + wa * pass_bytes_per_bit, wb, lane}.get(0); }
+        }
+        q += (wa + wb) * pass_bytes_per_bit;
+        acc_t va;
+        acc_t vb;
+        sum_pair<acc_t>(
+          xa, xb, cuda::std::max(wa, wb), lane_min_delta, pass_min_delta, carry, va, vb);
+        if (direct) {
+          output.store(static_cast<int32_t>(position + lane), static_cast<uint64_t>(va));
+          output.store(static_cast<int32_t>(position + warp_lanes + lane),
+                       static_cast<uint64_t>(vb));
+        } else {
+          output.place(static_cast<uint64_t>(va), position, row_a, value_limit);
+          output.place(static_cast<uint64_t>(vb), position + warp_lanes, row_b, value_limit);
+        }
+        position += 2 * warp_lanes;
+      }
+      p = next_block;
+      continue;
+    }
+
     uint8_t const* cursor = mb_start;
     uint32_t mb           = 0;
     uint32_t mb_pass      = 0;
     uint32_t width        = 0;
     for (uint32_t done = 0; done < block_needed and not error; done += group_passes) {
-      if (reinterpret_cast<uintptr_t>(cursor) + prefetch_window / 2 > prefetched &&
-          prefetched < page_end) {
-        prefetch_burst();
-      }
       uint32_t const count = cuda::std::min(uint32_t{group_passes}, block_needed - done);
       // Warp-uniform pass descriptors
       uint32_t pass_width[group_passes];
