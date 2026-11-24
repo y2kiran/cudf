@@ -571,6 +571,9 @@ CUDF_KERNEL void __launch_bounds__(decode_delta_binary_block_size)
  */
 namespace nz_lean_delta {
 
+// Experiment switch: explicit L2 page prefetches
+constexpr bool kL2Prefetch = false;
+
 using warp_tile = cg::thread_block_tile<cudf::detail::warp_size>;
 
 constexpr uint32_t warp_lanes   = cudf::detail::warp_size;
@@ -1376,7 +1379,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       if (line < page_end) {
         // Page data is in global memory; this drops the run-time address space check.
         __builtin_assume(__isGlobal(reinterpret_cast<void const*>(line)));
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+        if constexpr (kL2Prefetch) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line)); }
       }
     }
     prefetched += prefetch_window;
@@ -1442,7 +1445,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         if (at >= next_step) {
           auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
           if (lane < 16 and line < page_end) {
-            asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+            if constexpr (kL2Prefetch) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line)); }
           }
           next_step += steady_step;
         }
@@ -1620,7 +1623,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                 if (at2 >= next_step) {
                   auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
                   if (lane < 16 and line < page_end) {
-                    asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+                    if constexpr (kL2Prefetch) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line)); }
                   }
                   next_step += steady_step;
                 }
