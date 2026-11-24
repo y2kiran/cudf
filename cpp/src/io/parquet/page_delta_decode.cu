@@ -653,7 +653,8 @@ __device__ __forceinline__ uint32_t inclusive_sum32(uint32_t x)
 {
 #pragma unroll
   for (uint32_t offset = 1; offset < warp_lanes; offset *= 2) {
-    asm volatile(
+    // Not volatile, so the scans of independent passes may interleave.
+    asm(
       "{\n\t.reg .u32 r0;\n\t.reg .pred p;\n\t"
       "shfl.sync.up.b32 r0|p, %1, %2, 0, 0xffffffff;\n\t"
       "@p add.u32 r0, r0, %1;\n\t"
@@ -832,6 +833,56 @@ __device__ __forceinline__ void unpack_mini_block64(uint8_t const* q,
     uint32_t const b1       = spans ? __ldg(w + W + 1) : 0u;
     xa                      = __funnelshift_r(a0, a1, shift) & mask;
     xb                      = __funnelshift_r(b0, b1, shift) & mask;
+  }
+}
+
+/**
+ * @brief Decodes a block of four 64-value mini-blocks that all have the compile-time width `W`.
+ *
+ * Every pass starts a whole number of words after the first, at the same bit offset, so the lane
+ * issues all of the block's payload loads from one address before unpacking and scanning. `place`
+ * receives each mini-block's two values in order.
+ */
+template <uint32_t W, typename acc_t, typename Place>
+__device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
+                                                       uint32_t lane,
+                                                       acc_t lane_min_delta,
+                                                       acc_t pass_min_delta,
+                                                       acc_t& carry,
+                                                       Place&& place)
+{
+  constexpr uint32_t passes = 8;
+  uint32_t x[passes];
+  if constexpr (W == 0) {
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      x[k] = 0;
+    }
+  } else {
+    auto const addr      = reinterpret_cast<uintptr_t>(q);
+    uint32_t const bit   = static_cast<uint32_t>(addr % 4) * byte_bits + lane * W;
+    auto const* const w  = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
+    uint32_t const shift = bit % 32;
+    constexpr uint32_t mask = W < 32 ? (1u << W) - 1 : ~0u;
+    bool const spans        = shift + W > 32;
+    uint32_t lo[passes];
+    uint32_t hi[passes];
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      lo[k] = __ldg(w + k * W);
+      hi[k] = spans ? __ldg(w + k * W + 1) : 0u;
+    }
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      x[k] = __funnelshift_r(lo[k], hi[k], shift) & mask;
+    }
+  }
+#pragma unroll
+  for (uint32_t m = 0; m < passes / 2; ++m) {
+    acc_t va;
+    acc_t vb;
+    sum_pair<acc_t>(x[2 * m], x[2 * m + 1], W, lane_min_delta, pass_min_delta, carry, va, vb);
+    place(va, vb);
   }
 }
 
@@ -1136,6 +1187,20 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     }
   };
 
+  // Page data is also moved from L2 into L1 ahead of the read position, in bursts of eight lines.
+  constexpr uint32_t l1_window = 8 * cache_line_bytes;
+  uintptr_t l1_prefetched      = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
+  auto l1_prefetch             = [&](uintptr_t cursor) {
+    if (cursor + l1_window > l1_prefetched) {
+      l1_prefetched = cuda::std::max(l1_prefetched, cursor & ~uintptr_t{cache_line_bytes - 1});
+      auto const line = l1_prefetched + lane * cache_line_bytes;
+      if (lane < l1_window / cache_line_bytes && line < page_end) {
+        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
+      }
+      l1_prefetched += l1_window;
+    }
+  };
+
   bool error = false;
   if (position < value_limit) { prefetch_burst(); }
   while (position < value_limit) {
@@ -1280,6 +1345,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         prefetched < page_end) {
       prefetch_burst();
     }
+    l1_prefetch(reinterpret_cast<uintptr_t>(mb_start));
 
     auto const min_delta = static_cast<acc_t>(min_delta_bits);
     // `min_delta` contributions of a lane's value and of a whole pass
@@ -1306,6 +1372,20 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         position += 2 * warp_lanes;
       };
+      if (mb_shift != 0 and mb_count == 4 and
+          packed_widths == (packed_widths & 0xffu) * 0x0101'0101ull) {
+        // Four 64-value mini-blocks of one compile-time width
+        dispatch_width<wide>(static_cast<uint32_t>(packed_widths & 0xffu), [&]<uint32_t W>() {
+          decode_uniform_block64<W, acc_t>(
+            q, lane, lane_min_delta, pass_min_delta, carry, [&](acc_t va, acc_t vb) {
+              int32_t const row_a = output.load_row(position + lane, value_limit);
+              int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
+              place_pair(va, vb, row_a, row_b);
+            });
+        });
+        p = next_block;
+        continue;
+      }
       if (mb_shift != 0) {
         // 64-value mini-blocks, each at a compile-time width
         for (uint32_t m = 0; m < mb_count; ++m) {
