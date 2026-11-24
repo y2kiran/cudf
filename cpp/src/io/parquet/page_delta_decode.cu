@@ -1246,7 +1246,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
   auto stage            = [&](uint32_t buf, uintptr_t at, uint32_t bytes) {
     auto const base = at & ~uintptr_t{stage_chunk - 1};
     auto const chunks =
-      cuda::std::min(stage_chunks, static_cast<uint32_t>((at - base + bytes + stage_chunk - 1) / stage_chunk));
+      cuda::std::min(uint32_t{stage_chunks}, static_cast<uint32_t>((at - base + bytes + stage_chunk - 1) / stage_chunk));
     uint32_t* const dst = stage_buffers + buf * stage_words;
     for (uint32_t c = lane; c < chunks; c += warp_lanes) {
       auto const src = base + stage_chunk * c;
