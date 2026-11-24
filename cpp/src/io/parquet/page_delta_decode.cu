@@ -942,31 +942,37 @@ __device__ __forceinline__ void sum8(uint32_t const (&x)[8],
  * receives each mini-block's two values in order.
  */
 /**
- * @brief Loads this lane's packed words of a block of four 64-value mini-blocks of width `W` at
- * `q`, ahead of their unpacking by `unpack_uniform_words`.
+ * @brief This lane's packed words of a block of four 64-value mini-blocks of width `W`, loaded
+ * ahead of their unpacking.
  */
 template <uint32_t W>
-__device__ __forceinline__ void load_uniform_words(
-  uint8_t const* q, uint32_t lane, uint32_t (&lo)[8], uint32_t (&hi)[8], uint32_t& shift)
+struct uniform_words {
+  uint32_t lo[8];
+  uint32_t hi[8];
+  uint32_t shift;
+};
+
+template <uint32_t W>
+__device__ __forceinline__ void load_uniform_words(uint8_t const* q,
+                                                   uint32_t lane,
+                                                   uniform_words<W>& words)
 {
   if constexpr (W != 0) {
     auto const addr     = reinterpret_cast<uintptr_t>(q);
     uint32_t const bit  = static_cast<uint32_t>(addr % 4) * byte_bits + lane * W;
     auto const* const w = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3}) + bit / 32;
-    shift               = bit % 32;
-    bool const spans    = shift + W > 32;
+    words.shift         = bit % 32;
+    bool const spans    = words.shift + W > 32;
 #pragma unroll
     for (uint32_t k = 0; k < 8; ++k) {
-      lo[k] = __ldg(w + k * W);
-      hi[k] = spans ? __ldg(w + k * W + 1) : 0u;
+      words.lo[k] = __ldg(w + k * W);
+      words.hi[k] = spans ? __ldg(w + k * W + 1) : 0u;
     }
   }
 }
 
 template <uint32_t W>
-__device__ __forceinline__ void unpack_uniform_words(uint32_t const (&lo)[8],
-                                                     uint32_t const (&hi)[8],
-                                                     uint32_t shift,
+__device__ __forceinline__ void unpack_uniform_words(uniform_words<W> const& words,
                                                      uint32_t (&x)[8])
 {
   constexpr uint32_t mask = W < 32 ? (1u << W) - 1 : ~0u;
@@ -975,7 +981,7 @@ __device__ __forceinline__ void unpack_uniform_words(uint32_t const (&lo)[8],
     if constexpr (W == 0) {
       x[k] = 0;
     } else {
-      x[k] = __funnelshift_r(lo[k], hi[k], shift) & mask;
+      x[k] = __funnelshift_r(words.lo[k], words.hi[k], words.shift) & mask;
     }
   }
 }
@@ -1586,11 +1592,11 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
               // Software pipeline: the payload of the next block is loaded while this block's
               // values are summed and stored.
               uint32_t x[8];
-              uint32_t lo[8];
-              uint32_t hi[8];
-              uint32_t shift = 0;
-              load_uniform_words<W>(block_q, lane, lo, hi, shift);
-              unpack_uniform_words<W>(lo, hi, shift, x);
+              {
+                uniform_words<W> words;
+                load_uniform_words<W>(block_q, lane, words);
+                unpack_uniform_words<W>(words, x);
+              }
               while (true) {
                 // Parse the next block's header if it has the same shape and lies wholly in the
                 // page and in the values to decode.
@@ -1656,14 +1662,14 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                   next_next = next_q + block_bytes;
                   next_ok   = next_ok and reinterpret_cast<uintptr_t>(next_next) <= page_end;
                 }
-                // Without a next block, the loads repeat this block's, which are in bounds.
-                load_uniform_words<W>(next_ok ? next_q : block_q, lane, lo, hi, shift);
+                uniform_words<W> words;
+                if (next_ok) { load_uniform_words<W>(next_q, lane, words); }
 
                 sum8<acc_t>(x, W, block_lane_min_delta, block_pass_min_delta, carry, place_values);
                 p = block_next;
                 if (not next_ok) { return; }
 
-                unpack_uniform_words<W>(lo, hi, shift, x);
+                unpack_uniform_words<W>(words, x);
                 block_q    = next_q;
                 block_next = next_next;
                 // One touch per sector covers `warp_lanes` sectors, the next `touch_blocks`
