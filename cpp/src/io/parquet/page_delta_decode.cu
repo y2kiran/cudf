@@ -1430,8 +1430,10 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
       static_assert(prefetch_window == 2 * steady_step);
       // One word of each line of the next block, loaded so the lines are in L1 when that block is
-      // decoded. The value is consumed (by an empty asm) one block later, when it has long landed.
-      uint32_t touched = 0;
+      // decoded. Each value is folded into `touch_sum` one block later, when it has long landed;
+      // the sum is kept only so the loads are not removed.
+      uint32_t touched   = 0;
+      uint32_t touch_sum = 0;
       while (position + block_values <= value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
         auto const aligned = at & ~uintptr_t{word_bytes - 1};
@@ -1495,12 +1497,12 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         if (not widths_fit or reinterpret_cast<uintptr_t>(next) > page_end) { break; }
         {
           // The next block is assumed to be about as long as this one.
-          asm volatile("" ::"r"(touched));
+          touch_sum ^= touched;
           auto const next_at = reinterpret_cast<uintptr_t>(next);
           auto const line =
             (next_at & ~uintptr_t{cache_line_bytes - 1}) + lane * cache_line_bytes;
           if (line < page_end and line < next_at + (next_at - at) + sizeof(uint32_t)) {
-            touched = __ldg(reinterpret_cast<uint32_t const*>(line));
+            asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(touched) : "l"(line));
           }
         }
 
@@ -1570,7 +1572,11 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         p = next;
       }
-      asm volatile("" ::"r"(touched));
+      touch_sum ^= touched;
+      if (touch_sum == 0x2545'f491u) {
+        __shared__ uint32_t touch_sink;
+        touch_sink = touch_sum;
+      }
       // The general loop's prefetch bookkeeping resumes from here.
       prefetched    = cuda::std::max(prefetched, next_step + 2 * steady_step);
       l1_prefetched = cuda::std::max(l1_prefetched, next_step + steady_step);
