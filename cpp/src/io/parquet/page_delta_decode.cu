@@ -647,17 +647,6 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
 }
 
 /**
- * @brief Brings the line holding `line` into L1 by an asynchronous 4-byte copy into the discarded
- * shared-memory word `sink`; unlike a register load it leaves nothing for later instructions to
- * wait on.
- */
-__device__ __forceinline__ void fetch_to_l1(uintptr_t line, uint32_t* sink)
-{
-  auto const shared = static_cast<uint32_t>(__cvta_generic_to_shared(sink));
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(shared), "l"(line));
-}
-
-/**
  * @brief Warp-wide inclusive sum of 32-bit values; each step is one shuffle and one predicated add.
  */
 __device__ __forceinline__ uint32_t inclusive_sum32(uint32_t x)
@@ -1361,17 +1350,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     prefetched += prefetch_window;
   };
 
-  // Discarded destinations of the L1 fetches, one word per lane
-  __shared__ uint32_t l1_sink[warp_lanes];
-  uint32_t* const sink = l1_sink + lane;
-
   // Starts moving the first two lines of the block at `at` (its header and the start of its packed
   // values) into L1 one block ahead.
   auto stage = [&](uint8_t const* at) {
     if (lane < 2) {
       auto const line = (reinterpret_cast<uintptr_t>(at) & ~uintptr_t{cache_line_bytes - 1}) +
                         lane * cache_line_bytes;
-      if (line < page_end) { fetch_to_l1(line, sink); }
+      if (line < page_end) { asm volatile("prefetch.global.L1 [%0];" ::"l"(line)); }
     }
   };
 
@@ -1383,7 +1368,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       l1_prefetched = cuda::std::max(l1_prefetched, cursor & ~uintptr_t{cache_line_bytes - 1});
       auto const line = l1_prefetched + lane * cache_line_bytes;
       if (lane < l1_window / cache_line_bytes && line < page_end) {
-        fetch_to_l1(line, sink);
+        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
       }
       l1_prefetched += l1_window;
     }
@@ -1413,7 +1398,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
       static_assert(prefetch_window == 2 * steady_step);
       if (auto const line = next_step + lane * cache_line_bytes; lane < 16 and line < page_end) {
-        fetch_to_l1(line, sink);
+        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
       }
       while (position + block_values <= value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
@@ -1424,7 +1409,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                                                    : 2 * steady_step + (lane - 16) * cache_line_bytes);
           if (line < page_end) {
             if (lane < 16) {
-              fetch_to_l1(line, sink);
+              asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
             } else {
               asm volatile("prefetch.global.L2::evict_normal [%0];" ::"l"(line));
             }
@@ -1877,8 +1862,6 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     if (error) { break; }
     p = next_block;
   }
-  // No fetch may still target the shared sink when the block exits.
-  asm volatile("cp.async.wait_all;" ::: "memory");
   if (error) {
     return static_cast<kernel_error::value_type>(decode_error::DELTA_PARAMS_UNSUPPORTED);
   }
