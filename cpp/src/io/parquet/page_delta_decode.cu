@@ -1467,76 +1467,80 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         position += 2 * warp_lanes;
       };
-      // Bytes 0 .. mb_count - 1 set to one
-      uint64_t const mb_bytes_one =
-        mb_count < max_packed_widths ? 0x0101'0101'0101'0101ull & ((uint64_t{1} << (byte_bits * mb_count)) - 1)
-                                     : 0x0101'0101'0101'0101ull;
-      if (mb_shift != 0 and packed_widths == (packed_widths & 0xffu) * mb_bytes_one) {
-        // 64-value mini-blocks of one compile-time width, four at a time
-        dispatch_width<wide>(static_cast<uint32_t>(packed_widths & 0xffu), [&]<uint32_t W>() {
-          auto place_staged = [&](acc_t va, acc_t vb) {
+      // The width-templated paths are instantiated only for native integer outputs without nulls,
+      // which bounds the code size; other pages use the runtime-width loop below.
+      if constexpr (not Mapped and Width != 0) {
+        // Bytes 0 .. mb_count - 1 set to one
+        uint64_t const mb_bytes_one =
+          mb_count < max_packed_widths ? 0x0101'0101'0101'0101ull & ((uint64_t{1} << (byte_bits * mb_count)) - 1)
+                                       : 0x0101'0101'0101'0101ull;
+        if (mb_shift != 0 and packed_widths == (packed_widths & 0xffu) * mb_bytes_one) {
+          // 64-value mini-blocks of one compile-time width, four at a time
+          dispatch_width<wide>(static_cast<uint32_t>(packed_widths & 0xffu), [&]<uint32_t W>() {
+            auto place_staged = [&](acc_t va, acc_t vb) {
+              int32_t const row_a = output.load_row(position + lane, value_limit);
+              int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
+              place_pair(va, vb, row_a, row_b);
+            };
+            // Packed bytes of one 64-value mini-block
+            constexpr uint32_t mb_bytes = 2 * W * pass_bytes_per_bit;
+            uint32_t m                  = 0;
+            for (; m + 4 <= mb_count; m += 4) {
+              auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
+              decode_uniform_block64<W, acc_t>(current_words + offset / sizeof(uint32_t),
+                                               (offset % sizeof(uint32_t)) * byte_bits,
+                                               lane,
+                                               lane_min_delta,
+                                               pass_min_delta,
+                                               carry,
+                                               place_staged);
+              q += 4 * mb_bytes;
+            }
+            for (; m < mb_count; ++m) {
+              auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
+              uint32_t xa;
+              uint32_t xb;
+              unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
+                                     (offset % sizeof(uint32_t)) * byte_bits,
+                                     lane,
+                                     xa,
+                                     xb);
+              acc_t va;
+              acc_t vb;
+              sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
+              place_staged(va, vb);
+              q += mb_bytes;
+            }
+          });
+          p = next_block;
+          continue;
+        }
+        if (mb_shift != 0) {
+          // 64-value mini-blocks, each at a compile-time width
+          for (uint32_t m = 0; m < mb_count; ++m) {
+            auto const w = static_cast<uint32_t>(packed_widths >> (byte_bits * m)) & 0xffu;
             int32_t const row_a = output.load_row(position + lane, value_limit);
             int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
+            acc_t va{};
+            acc_t vb{};
+            dispatch_width<wide>(w, [&]<uint32_t W>() {
+              uint32_t xa;
+              uint32_t xb;
+              auto const offset =
+                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
+              unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
+                                     (offset % sizeof(uint32_t)) * byte_bits,
+                                     lane,
+                                     xa,
+                                     xb);
+              sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
+            });
+            q += w * 2 * pass_bytes_per_bit;
             place_pair(va, vb, row_a, row_b);
-          };
-          // Packed bytes of one 64-value mini-block
-          constexpr uint32_t mb_bytes = 2 * W * pass_bytes_per_bit;
-          uint32_t m                  = 0;
-          for (; m + 4 <= mb_count; m += 4) {
-            auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
-            decode_uniform_block64<W, acc_t>(current_words + offset / sizeof(uint32_t),
-                                             (offset % sizeof(uint32_t)) * byte_bits,
-                                             lane,
-                                             lane_min_delta,
-                                             pass_min_delta,
-                                             carry,
-                                             place_staged);
-            q += 4 * mb_bytes;
           }
-          for (; m < mb_count; ++m) {
-            auto const offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
-            uint32_t xa;
-            uint32_t xb;
-            unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
-                                   (offset % sizeof(uint32_t)) * byte_bits,
-                                   lane,
-                                   xa,
-                                   xb);
-            acc_t va;
-            acc_t vb;
-            sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-            place_staged(va, vb);
-            q += mb_bytes;
-          }
-        });
-        p = next_block;
-        continue;
-      }
-      if (mb_shift != 0) {
-        // 64-value mini-blocks, each at a compile-time width
-        for (uint32_t m = 0; m < mb_count; ++m) {
-          auto const w = static_cast<uint32_t>(packed_widths >> (byte_bits * m)) & 0xffu;
-          int32_t const row_a = output.load_row(position + lane, value_limit);
-          int32_t const row_b = output.load_row(position + warp_lanes + lane, value_limit);
-          acc_t va{};
-          acc_t vb{};
-          dispatch_width<wide>(w, [&]<uint32_t W>() {
-            uint32_t xa;
-            uint32_t xb;
-            auto const offset =
-              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(q) - current_base);
-            unpack_mini_block64<W>(current_words + offset / sizeof(uint32_t),
-                                   (offset % sizeof(uint32_t)) * byte_bits,
-                                   lane,
-                                   xa,
-                                   xb);
-            sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-          });
-          q += w * 2 * pass_bytes_per_bit;
-          place_pair(va, vb, row_a, row_b);
+          p = next_block;
+          continue;
         }
-        p = next_block;
-        continue;
       }
       for (uint32_t k = 0; k < block_passes; k += 2) {
         auto const wa =
