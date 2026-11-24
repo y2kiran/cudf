@@ -653,8 +653,7 @@ __device__ __forceinline__ uint32_t inclusive_sum32(uint32_t x)
 {
 #pragma unroll
   for (uint32_t offset = 1; offset < warp_lanes; offset *= 2) {
-    // Not volatile, so the scans of independent passes may interleave.
-    asm(
+    asm volatile(
       "{\n\t.reg .u32 r0;\n\t.reg .pred p;\n\t"
       "shfl.sync.up.b32 r0|p, %1, %2, 0, 0xffffffff;\n\t"
       "@p add.u32 r0, r0, %1;\n\t"
