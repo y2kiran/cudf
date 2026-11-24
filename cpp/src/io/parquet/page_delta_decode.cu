@@ -1429,6 +1429,9 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       constexpr uint32_t steady_step = 16 * cache_line_bytes;
       uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
       static_assert(prefetch_window == 2 * steady_step);
+      // One word of each line of the next block, loaded so the lines are in L1 when that block is
+      // decoded. The value is consumed (by an empty asm) one block later, when it has long landed.
+      uint32_t touched = 0;
       while (position + block_values <= value_limit) {
         auto const at      = reinterpret_cast<uintptr_t>(p);
         auto const aligned = at & ~uintptr_t{word_bytes - 1};
@@ -1490,6 +1493,16 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         auto const* q          = p + len + mb_count;
         auto const* const next = q + mb_bytes_per_bit * width_sum;
         if (not widths_fit or reinterpret_cast<uintptr_t>(next) > page_end) { break; }
+        {
+          // The next block is assumed to be about as long as this one.
+          asm volatile("" ::"r"(touched));
+          auto const next_at = reinterpret_cast<uintptr_t>(next);
+          auto const line =
+            (next_at & ~uintptr_t{cache_line_bytes - 1}) + lane * cache_line_bytes;
+          if (line < page_end and line < next_at + (next_at - at) + sizeof(uint32_t)) {
+            touched = __ldg(reinterpret_cast<uint32_t const*>(line));
+          }
+        }
 
         auto const min_delta       = static_cast<acc_t>(zigzag_decode(v));
         acc_t const lane_min_delta = static_cast<acc_t>(lane + 1) * min_delta;
@@ -1557,6 +1570,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
         }
         p = next;
       }
+      asm volatile("" ::"r"(touched));
       // The general loop's prefetch bookkeeping resumes from here.
       prefetched    = cuda::std::max(prefetched, next_step + 2 * steady_step);
       l1_prefetched = cuda::std::max(l1_prefetched, next_step + steady_step);
