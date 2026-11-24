@@ -917,6 +917,64 @@ __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
   }
 }
 
+/**
+ * @brief Decodes a block of four 64-value mini-blocks with runtime widths `widths` (one byte each)
+ * packed from `q`, issuing all of the lane's payload loads before unpacking and scanning.
+ *
+ * Within a mini-block both halves share one bit offset, the second half `w` words after the first.
+ */
+template <typename acc_t, typename Place>
+__device__ __forceinline__ void decode_mixed_block64(uint8_t const* q,
+                                                     uint32_t widths,
+                                                     uint32_t lane,
+                                                     acc_t lane_min_delta,
+                                                     acc_t pass_min_delta,
+                                                     acc_t& carry,
+                                                     Place&& place)
+{
+  constexpr uint32_t mini_blocks = 4;
+  uint32_t lo[2 * mini_blocks];
+  uint32_t hi[2 * mini_blocks];
+  uint32_t shift[mini_blocks];
+  uint32_t mask[mini_blocks];
+  auto const addr = reinterpret_cast<uintptr_t>(q);
+  // Bit offset of this lane's value from the aligned word below `q`
+  uint32_t bit = static_cast<uint32_t>(addr % 4) * byte_bits;
+  auto const* const base = reinterpret_cast<uint32_t const*>(addr & ~uintptr_t{3});
+#pragma unroll
+  for (uint32_t m = 0; m < mini_blocks; ++m) {
+    uint32_t const w      = (widths >> (byte_bits * m)) & 0xffu;
+    uint32_t const at     = bit + lane * w;
+    auto const* const ptr = base + at / 32;
+    shift[m]              = at % 32;
+    mask[m]               = w < 32 ? (1u << w) - 1 : ~0u;
+    bool const nonzero    = w != 0;
+    bool const spans      = shift[m] + w > 32;
+    lo[2 * m]             = nonzero ? __ldg(ptr) : 0u;
+    lo[2 * m + 1]         = nonzero ? __ldg(ptr + w) : 0u;
+    hi[2 * m]             = spans ? __ldg(ptr + 1) : 0u;
+    hi[2 * m + 1]         = spans ? __ldg(ptr + w + 1) : 0u;
+    // The next mini-block starts 64 * w bits later.
+    bit += 2 * warp_lanes * w;
+  }
+#pragma unroll
+  for (uint32_t m = 0; m < mini_blocks; ++m) {
+    uint32_t const xa = __funnelshift_r(lo[2 * m], hi[2 * m], shift[m]) & mask[m];
+    uint32_t const xb = __funnelshift_r(lo[2 * m + 1], hi[2 * m + 1], shift[m]) & mask[m];
+    acc_t va;
+    acc_t vb;
+    sum_pair<acc_t>(xa,
+                    xb,
+                    (widths >> (byte_bits * m)) & 0xffu,
+                    lane_min_delta,
+                    pass_min_delta,
+                    carry,
+                    va,
+                    vb);
+    place(va, vb);
+  }
+}
+
 #define CUDF_NZ_DELTA_WIDTH_CASE(n) \
   case n: f.template operator()<n>(); break;
 
@@ -1327,7 +1385,13 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             continue;
           }
         }
-        // Mixed widths: one runtime-width body for every width
+        if (mb_shift != 0 and mb_count == 4) {
+          // Mixed widths: one runtime-width body with all payload loads up front
+          decode_mixed_block64<acc_t>(
+            q, widths, lane, lane_min_delta, pass_min_delta, carry, place_values);
+          p = next;
+          continue;
+        }
         for (uint32_t k = 0; k < block_passes; k += 2) {
           auto const wa = (widths >> (byte_bits * (k >> mb_shift))) & 0xffu;
           auto const wb = (widths >> (byte_bits * ((k + 1) >> mb_shift))) & 0xffu;
