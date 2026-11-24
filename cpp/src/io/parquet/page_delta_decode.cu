@@ -1191,10 +1191,20 @@ struct rank_map_output {
    */
   __device__ __forceinline__ uint8_t* store_pair(uint8_t* out, uint64_t a, uint64_t b) const
   {
-    // The output column is in global memory; this selects global stores.
+    // The output column is in global memory; this selects global stores. Native widths use
+    // streaming stores so the output, written once, does not evict the page data prefetched
+    // into L2.
     __builtin_assume(__isGlobal(out));
-    store_value<Width>(out, dtype_len, a);
-    store_value<Width>(out + warp_lanes * width(), dtype_len, b);
+    if constexpr (Width == 8) {
+      __stcs(reinterpret_cast<long long*>(out), static_cast<long long>(a));
+      __stcs(reinterpret_cast<long long*>(out + warp_lanes * Width), static_cast<long long>(b));
+    } else if constexpr (Width == 4) {
+      __stcs(reinterpret_cast<int*>(out), static_cast<int>(a));
+      __stcs(reinterpret_cast<int*>(out + warp_lanes * Width), static_cast<int>(b));
+    } else {
+      store_value<Width>(out, dtype_len, a);
+      store_value<Width>(out + warp_lanes * width(), dtype_len, b);
+    }
     return out + 2 * warp_lanes * width();
   }
 
@@ -1343,8 +1353,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       if (line < page_end) {
         // Page data is in global memory; this drops the run-time address space check.
         __builtin_assume(__isGlobal(reinterpret_cast<void const*>(line)));
-        cuda::apply_access_property(
-          reinterpret_cast<void const*>(line), cache_line_bytes, cuda::access_property::normal{});
+        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
       }
     }
     prefetched += prefetch_window;
@@ -1411,7 +1420,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
             if (lane < 16) {
               asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
             } else {
-              asm volatile("prefetch.global.L2::evict_normal [%0];" ::"l"(line));
+              asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
             }
           }
           next_step += steady_step;
