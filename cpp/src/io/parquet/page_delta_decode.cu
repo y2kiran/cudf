@@ -1502,7 +1502,9 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
           auto const next_at = reinterpret_cast<uintptr_t>(next);
           constexpr uint32_t sector_bytes = 32;
           auto const line = (next_at & ~uintptr_t{sector_bytes - 1}) + lane * sector_bytes;
-          if (line < page_end and line < next_at + (next_at - at) + sizeof(uint32_t)) {
+          // Blocks shorter than a line gain nothing from it: their lines are already arriving.
+          if (next_at - at >= cache_line_bytes and line < page_end and
+              line < next_at + (next_at - at) + sizeof(uint32_t)) {
             asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(touched) : "l"(line));
           }
         }
