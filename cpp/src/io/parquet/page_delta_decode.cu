@@ -1219,11 +1219,11 @@ struct rank_map_output {
     // into L2.
     __builtin_assume(__isGlobal(out));
     if constexpr (Width == 8) {
-      __stcs(reinterpret_cast<long long*>(out), static_cast<long long>(a));
-      __stcs(reinterpret_cast<long long*>(out + warp_lanes * Width), static_cast<long long>(b));
+      *reinterpret_cast<long long*>(out)                      = static_cast<long long>(a);
+      *reinterpret_cast<long long*>(out + warp_lanes * Width) = static_cast<long long>(b);
     } else if constexpr (Width == 4) {
-      __stcs(reinterpret_cast<int*>(out), static_cast<int>(a));
-      __stcs(reinterpret_cast<int*>(out + warp_lanes * Width), static_cast<int>(b));
+      *reinterpret_cast<int*>(out)                      = static_cast<int>(a);
+      *reinterpret_cast<int*>(out + warp_lanes * Width) = static_cast<int>(b);
     } else {
       store_value<Width>(out, dtype_len, a);
       store_value<Width>(out + warp_lanes * width(), dtype_len, b);
