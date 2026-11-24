@@ -647,6 +647,16 @@ __device__ __forceinline__ uint64_t clear_past_end(uint64_t w, uintptr_t word, u
 }
 
 /**
+ * @brief Loads one word of the line at `line` so that the line is allocated in L1; the result is
+ * never read.
+ */
+__device__ __forceinline__ void touch_l1(uintptr_t line)
+{
+  uint32_t unused;
+  asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(unused) : "l"(line));
+}
+
+/**
  * @brief Warp-wide inclusive sum of 32-bit values; each step is one shuffle and one predicated add.
  */
 __device__ __forceinline__ uint32_t inclusive_sum32(uint32_t x)
@@ -877,12 +887,44 @@ __device__ __forceinline__ void decode_uniform_block64(uint8_t const* q,
       x[k] = __funnelshift_r(lo[k], hi[k], shift) & mask;
     }
   }
+  if constexpr (sizeof(acc_t) == sizeof(uint64_t) and W > max_narrow_width) {
+    // The high bits (< 8) of four passes share one scan of 8-bit fields (32 * 7 < 256); see
+    // `sum_pair`.
+    constexpr uint32_t group = 4;
+    uint32_t high_sums[passes / group];
+    uint32_t high_all[passes / group];
 #pragma unroll
-  for (uint32_t m = 0; m < passes / 2; ++m) {
-    acc_t va;
-    acc_t vb;
-    sum_pair<acc_t>(x[2 * m], x[2 * m + 1], W, lane_min_delta, pass_min_delta, carry, va, vb);
-    place(va, vb);
+    for (uint32_t g = 0; g < passes / group; ++g) {
+      uint32_t highs = 0;
+#pragma unroll
+      for (uint32_t j = 0; j < group; ++j) {
+        highs |= (x[g * group + j] >> max_narrow_width) << (byte_bits * j);
+      }
+      high_sums[g] = inclusive_sum32(highs);
+      high_all[g]  = __shfl_sync(0xffff'ffffu, high_sums[g], warp_lanes - 1);
+    }
+    auto widen = [](uint32_t sum, uint32_t high) {
+      return static_cast<acc_t>(static_cast<uint64_t>(sum - (high << max_narrow_width)) +
+                                (static_cast<uint64_t>(high) << max_narrow_width));
+    };
+    acc_t v[passes];
+#pragma unroll
+    for (uint32_t k = 0; k < passes; ++k) {
+      uint32_t const sums  = inclusive_sum32(x[k]);
+      uint32_t const all   = __shfl_sync(0xffff'ffffu, sums, warp_lanes - 1);
+      uint32_t const field = byte_bits * (k % group);
+      v[k]                 = carry + lane_min_delta + widen(sums, (high_sums[k / group] >> field) & 0xffu);
+      carry += widen(all, (high_all[k / group] >> field) & 0xffu) + pass_min_delta;
+      if (k % 2 == 1) { place(v[k - 1], v[k]); }
+    }
+  } else {
+#pragma unroll
+    for (uint32_t m = 0; m < passes / 2; ++m) {
+      acc_t va;
+      acc_t vb;
+      sum_pair<acc_t>(x[2 * m], x[2 * m + 1], W, lane_min_delta, pass_min_delta, carry, va, vb);
+      place(va, vb);
+    }
   }
 }
 
@@ -1179,11 +1221,22 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
 
   // Starts moving the first two lines of the block at `at` (its header and the start of its packed
   // values) into L1 one block ahead.
+  // The two aligned words holding the start of the header at `header_at`, loaded one block ahead
+  uint8_t const* header_at = nullptr;
+  uint64_t header_words_lo = 0;
+  uint64_t header_words_hi = 0;
   auto stage = [&](uint8_t const* at) {
+    auto const aligned = aligned_word(at);
+    if (aligned + 2 * word_bytes <= page_end) {
+      auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
+      header_at             = at;
+      header_words_lo       = __ldg(src);
+      header_words_hi       = __ldg(src + 1);
+    }
     if (lane < 2) {
       auto const line = (reinterpret_cast<uintptr_t>(at) & ~uintptr_t{cache_line_bytes - 1}) +
                         lane * cache_line_bytes;
-      if (line < page_end) { asm volatile("prefetch.global.L1 [%0];" ::"l"(line)); }
+      if (line < page_end) { touch_l1(line); }
     }
   };
 
@@ -1195,7 +1248,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       l1_prefetched = cuda::std::max(l1_prefetched, cursor & ~uintptr_t{cache_line_bytes - 1});
       auto const line = l1_prefetched + lane * cache_line_bytes;
       if (lane < l1_window / cache_line_bytes && line < page_end) {
-        asm volatile("prefetch.global.L1 [%0];" ::"l"(line));
+        touch_l1(line);
       }
       l1_prefetched += l1_window;
     }
@@ -1216,9 +1269,10 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       auto const aligned = aligned_word(p);
       if (mb_count <= 4 && aligned + 2 * word_bytes <= page_end) {
         auto const* const src = reinterpret_cast<unsigned long long const*>(aligned);
+        bool const staged     = header_at == p;
         uint64_t const window = extract64(
-          __ldg(src),
-          __ldg(src + 1),
+          staged ? header_words_lo : __ldg(src),
+          staged ? header_words_hi : __ldg(src + 1),
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p) - aligned) * byte_bits);
         uint32_t const stop = ~static_cast<uint32_t>(window) & 0x8080'8080u;
         if (stop != 0) {
