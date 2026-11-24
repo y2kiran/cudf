@@ -1429,8 +1429,8 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
       constexpr uint32_t steady_step = 16 * cache_line_bytes;
       uintptr_t next_step = reinterpret_cast<uintptr_t>(p) & ~uintptr_t{cache_line_bytes - 1};
       static_assert(prefetch_window == 2 * steady_step);
-      // One word of each line of the next block, loaded so the lines are in L1 when that block is
-      // decoded. Each value is stored to a discarded shared word one block later, when it has long
+      // One word of each 32-byte sector of the next block (L1 allocates sectors), loaded so the
+      // block is in L1 when it is decoded. Each value is stored to a discarded shared word one block later, when it has long
       // landed; the store keeps the load from being removed.
       __shared__ uint32_t touch_sink[warp_lanes];
       auto const sink = static_cast<uint32_t>(__cvta_generic_to_shared(touch_sink + lane));
@@ -1500,8 +1500,8 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
           // The next block is assumed to be about as long as this one.
           asm volatile("st.shared.u32 [%0], %1;" ::"r"(sink), "r"(touched));
           auto const next_at = reinterpret_cast<uintptr_t>(next);
-          auto const line =
-            (next_at & ~uintptr_t{cache_line_bytes - 1}) + lane * cache_line_bytes;
+          constexpr uint32_t sector_bytes = 32;
+          auto const line = (next_at & ~uintptr_t{sector_bytes - 1}) + lane * sector_bytes;
           if (line < page_end and line < next_at + (next_at - at) + sizeof(uint32_t)) {
             asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(touched) : "l"(line));
           }
