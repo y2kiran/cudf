@@ -1519,22 +1519,77 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
           if (mb_shift != 0 and widths == (widths & 0xffu) * mb_ones) {
             // 64-value mini-blocks of one compile-time width
             dispatch_width<wide>(widths & 0xffu, [&]<uint32_t W>() {
-              if (mb_count == 4) {
-                decode_uniform_block64<W, acc_t>(
-                  q, lane, lane_min_delta, pass_min_delta, carry, place_values);
+              if (mb_count != 4) {
+                for (uint32_t m = 0; m < mb_count; ++m) {
+                  uint32_t xa;
+                  uint32_t xb;
+                  unpack_mini_block64<W>(q + m * 2 * W * pass_bytes_per_bit, lane, xa, xb);
+                  acc_t va;
+                  acc_t vb;
+                  sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
+                  place_values(va, vb);
+                }
+                p = next;
                 return;
               }
-              for (uint32_t m = 0; m < mb_count; ++m) {
-                uint32_t xa;
-                uint32_t xb;
-                unpack_mini_block64<W>(q + m * 2 * W * pass_bytes_per_bit, lane, xa, xb);
-                acc_t va;
-                acc_t vb;
-                sum_pair<acc_t>(xa, xb, W, lane_min_delta, pass_min_delta, carry, va, vb);
-                place_values(va, vb);
+              // Four 64-value mini-blocks of width W. Keep decoding the following blocks here
+              // while they have the same shape: a minimum delta of at most four bytes and four
+              // widths of W. The first block that differs is left, unconsumed, at `p`.
+              constexpr uint32_t widths_w    = W * bytes_one;
+              constexpr uint32_t block_bytes = 4 * 2 * W * pass_bytes_per_bit;
+              uint8_t const* block_q         = q;
+              uint8_t const* block_next      = next;
+              acc_t block_lane_min_delta     = lane_min_delta;
+              acc_t block_pass_min_delta     = pass_min_delta;
+              while (true) {
+                decode_uniform_block64<W, acc_t>(block_q,
+                                                 lane,
+                                                 block_lane_min_delta,
+                                                 block_pass_min_delta,
+                                                 carry,
+                                                 place_values);
+                p = block_next;
+                if (position + block_values > value_limit) { return; }
+                auto const at2      = reinterpret_cast<uintptr_t>(p);
+                auto const aligned2 = at2 & ~uintptr_t{word_bytes - 1};
+                if (aligned2 + 2 * word_bytes > page_end) { return; }
+                if (at2 >= next_step) {
+                  auto const line = next_step + 2 * steady_step + lane * cache_line_bytes;
+                  if (lane < 16 and line < page_end) {
+                    asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(line));
+                  }
+                  next_step += steady_step;
+                }
+                auto const* const src2 = reinterpret_cast<unsigned long long const*>(aligned2);
+                uint64_t const window2 = extract64(
+                  __ldg(src2), __ldg(src2 + 1), static_cast<uint32_t>(at2 - aligned2) * byte_bits);
+                uint32_t const stop2 = ~static_cast<uint32_t>(window2) & 0x8080'8080u;
+                if (stop2 == 0) { return; }
+                auto const len2 = static_cast<uint32_t>(__ffs(static_cast<int>(stop2))) / byte_bits;
+                // len2 <= 4, so the window holds the four widths.
+                if (static_cast<uint32_t>(window2 >> (byte_bits * len2)) != widths_w) { return; }
+                block_q    = p + len2 + 4;
+                block_next = block_q + block_bytes;
+                if (reinterpret_cast<uintptr_t>(block_next) > page_end) { return; }
+                if constexpr (block_bytes + 1 + 4 >= cache_line_bytes) {
+                  asm volatile("st.shared.u32 [%0], %1;" ::"r"(sink), "r"(touched));
+                  constexpr uint32_t sector_bytes = 32;
+                  auto const next_at = reinterpret_cast<uintptr_t>(block_next);
+                  auto const line =
+                    (next_at & ~uintptr_t{sector_bytes - 1}) + lane * sector_bytes;
+                  if (line < page_end and line < next_at + (next_at - at2) + sizeof(uint32_t)) {
+                    asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(touched) : "l"(line));
+                  }
+                }
+                uint32_t const x2 =
+                  static_cast<uint32_t>(window2) & (len2 < 4 ? (1u << (byte_bits * len2)) - 1 : ~0u);
+                uint64_t const v2 = (x2 & 0x7fu) | ((x2 >> 1) & 0x3f80u) |
+                                    ((x2 >> 2) & 0x1f'c000u) | ((x2 >> 3) & 0xfe0'0000u);
+                auto const min_delta2 = static_cast<acc_t>(zigzag_decode(v2));
+                block_lane_min_delta  = static_cast<acc_t>(lane + 1) * min_delta2;
+                block_pass_min_delta  = static_cast<acc_t>(warp_lanes) * min_delta2;
               }
             });
-            p = next;
             continue;
           }
         }
