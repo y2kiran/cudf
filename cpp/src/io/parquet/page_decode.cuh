@@ -1107,7 +1107,7 @@ inline __device__ bool setup_local_page_info(auto* const s,
     static_assert(sizeof(PageInfo) % sizeof(uint32_t) == 0 and
                     sizeof(ColumnChunkDesc) % sizeof(uint32_t) == 0,
                   "The descriptors are copied in 4-byte words");
-    auto copy_words = [t](auto& dst, auto const& src) {
+    auto copy_words = [t, &group](auto& dst, auto const& src) {
       auto* const to         = reinterpret_cast<uint32_t*>(&dst);
       auto const* const from = reinterpret_cast<uint32_t const*>(&src);
       for (int i = t; i < static_cast<int>(sizeof(dst) / sizeof(uint32_t));
