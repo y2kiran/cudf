@@ -10,7 +10,6 @@
 #include "parquet_gpu.hpp"
 
 #include <cudf/detail/utilities/cuda.cuh>
-#include <cudf/detail/utilities/integer_utils.hpp>
 
 #include <cooperative_groups.h>
 #include <cuda/annotated_ptr>
@@ -35,14 +34,10 @@ constexpr int decode_delta_binary_block_size = 96;
 // warp_size; anything smaller lets the level decoder wrap onto entries the consumer is reading.
 constexpr int delta_nz_buf_size = 4 * delta_max_batch_size;
 
-// One warp decodes and writes each mapped page; a block holds several page warps, so more of them
-// are resident than the per-SM block limit would allow one-warp blocks.
-constexpr int32_t decode_delta_binary_with_nz_map_pages_per_block = 2;
-constexpr int32_t decode_delta_binary_with_nz_map_block_size =
-  decode_delta_binary_with_nz_map_pages_per_block * cudf::detail::warp_size;
-// Resident blocks per SM the register budget must allow: 40 page warps
-constexpr int32_t decode_delta_binary_with_nz_map_min_blocks =
-  40 / decode_delta_binary_with_nz_map_pages_per_block;
+// One warp decodes and writes each mapped page.
+constexpr int32_t decode_delta_binary_with_nz_map_block_size = cudf::detail::warp_size;
+// Resident page warps per SM the register budget must allow
+constexpr int32_t decode_delta_binary_with_nz_map_min_blocks = 32;
 
 // DELTA_BYTE_ARRAY encoding (incremental encoding or front compression), is used for BYTE_ARRAY
 // columns. For each element in a sequence of strings, a prefix length from the preceding string
@@ -2026,10 +2021,8 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
   size_t min_row,
   size_t num_rows)
 {
-  // One page state per warp of the block; each warp sets up its own page.
-  __shared__ __align__(16)
-    full_page_decode_state state_g[decode_delta_binary_with_nz_map_pages_per_block];
-  auto* const s = &state_g[warp.meta_group_rank()];
+  __shared__ __align__(16) full_page_decode_state state_g;
+  auto* const s = &state_g;
 
   [[maybe_unused]] null_count_back_copier _{s, static_cast<int32_t>(warp.thread_rank())};
   if (!setup_local_page_info(s,
@@ -2038,8 +2031,7 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
                              min_row,
                              num_rows,
                              mask_filter{decode_kernel_mask::DELTA_BINARY},
-                             page_processing_stage::DECODE,
-                             warp)) {
+                             page_processing_stage::DECODE)) {
     return 0;
   }
 
@@ -2089,12 +2081,10 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
 
 // Decodes flat DELTA_BINARY_PACKED pages, like `decode_delta_binary_kernel`, but places values
 // using the nz map's rank map instead of decoding definition levels itself. One warp decodes each
-// page, several pages per block, with no block-wide synchronization. The launch bounds cap
-// registers so that 40 page warps stay resident per SM.
+// page. The launch bounds cap registers so that 32 page warps stay resident per SM.
 CUDF_KERNEL void __launch_bounds__(decode_delta_binary_with_nz_map_block_size,
                                     decode_delta_binary_with_nz_map_min_blocks)
   decode_delta_binary_kernel_with_nz_map(PageInfo* pages,
-                                         size_t num_pages,
                                          device_span<ColumnChunkDesc const> chunks,
                                          size_t min_row,
                                          size_t num_rows,
@@ -2102,10 +2092,8 @@ CUDF_KERNEL void __launch_bounds__(decode_delta_binary_with_nz_map_block_size,
                                          kernel_error::pointer error_code)
 {
   auto const warp     = cg::tiled_partition<cudf::detail::warp_size>(cg::this_thread_block());
-  auto const page_idx = cg::this_grid().block_rank() * decode_delta_binary_with_nz_map_pages_per_block +
-                        warp.meta_group_rank();
+  auto const page_idx = cg::this_grid().block_rank();
 
-  if (page_idx >= num_pages) { return; }
   if (page_mask.size() > 0 and not page_mask[page_idx]) { return; }
   auto& page = pages[page_idx];
   // Pages with a map are decoded here; the level-decoding kernel takes the rest.
@@ -2791,20 +2779,16 @@ void decode_delta_binary(cudf::detail::hostdevice_span<PageInfo> pages,
   dim3 dim_block(decode_delta_binary_block_size, 1);
   dim3 dim_grid(pages.size(), 1);  // 1 threadblock per page
   dim3 dim_block_nz_map(decode_delta_binary_with_nz_map_block_size, 1);
-  dim3 dim_grid_nz_map(
-    cudf::detail::div_rounding_up_safe<size_t>(
-      pages.size(), static_cast<size_t>(decode_delta_binary_with_nz_map_pages_per_block)),
-    1);
 
   // `consumer_stream` is ordered after the producer by the caller. The level-decoding kernel below
   // needs no such ordering because it reads only fields set on the host.
   if (has_flat_nz_map) {
     // Not templated on `level_t`: this kernel never reads levels.
-    decode_delta_binary_kernel_with_nz_map<<<dim_grid_nz_map,
+    decode_delta_binary_kernel_with_nz_map<<<dim_grid,
                                              dim_block_nz_map,
                                              0,
                                              consumer_stream.get()>>>(
-      pages.device_ptr(), pages.size(), chunks, min_row, num_rows, page_mask, error_code);
+      pages.device_ptr(), chunks, min_row, num_rows, page_mask, error_code);
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 
