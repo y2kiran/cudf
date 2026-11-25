@@ -867,14 +867,13 @@ __device__ __forceinline__ void unpack_mini_block64(uint8_t const* q,
 template <typename acc_t, typename Place>
 __device__ __forceinline__ void sum_split8(uint32_t const (&x)[8],
                                            acc_t lane_min_delta,
-                                           acc_t pass_min_delta,
+                                           [[maybe_unused]] acc_t pass_min_delta,
                                            acc_t& carry,
                                            Place&& place)
 {
   constexpr uint32_t passes = 8;
   constexpr uint32_t group  = 4;
   uint32_t high_sums[passes / group];
-  uint32_t high_all[passes / group];
 #pragma unroll
   for (uint32_t g = 0; g < passes / group; ++g) {
     uint32_t highs = 0;
@@ -883,7 +882,6 @@ __device__ __forceinline__ void sum_split8(uint32_t const (&x)[8],
       highs |= (x[g * group + j] >> max_narrow_width) << (byte_bits * j);
     }
     high_sums[g] = inclusive_sum32(highs);
-    high_all[g]  = __shfl_sync(0xffff'ffffu, high_sums[g], warp_lanes - 1);
   }
   auto widen = [](uint32_t sum, uint32_t high) {
     return static_cast<acc_t>(static_cast<uint64_t>(sum - (high << max_narrow_width)) +
@@ -893,10 +891,11 @@ __device__ __forceinline__ void sum_split8(uint32_t const (&x)[8],
 #pragma unroll
   for (uint32_t k = 0; k < passes; ++k) {
     uint32_t const sums  = inclusive_sum32(x[k]);
-    uint32_t const all   = __shfl_sync(0xffff'ffffu, sums, warp_lanes - 1);
     uint32_t const field = byte_bits * (k % group);
     v[k]                 = carry + lane_min_delta + widen(sums, (high_sums[k / group] >> field) & 0xffu);
-    carry += widen(all, (high_all[k / group] >> field) & 0xffu) + pass_min_delta;
+    // Lane 31 holds the pass's last value, which the next pass continues from (its lane minimum
+    // delta is the pass minimum delta).
+    carry = __shfl_sync(0xffff'ffffu, v[k], warp_lanes - 1);
     if (k % 2 == 1) { place(v[k - 1], v[k]); }
   }
 }
