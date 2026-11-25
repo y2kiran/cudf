@@ -626,6 +626,23 @@ __device__ __forceinline__ uint64_t extract64(uint64_t lo, uint64_t hi, uint32_t
 }
 
 /**
+ * @brief Value of the ULEB128 varint of `len` (1 to 10) bytes whose bytes 0-7 are `lo` and bytes
+ * 8-15 are `hi`, keeping the low 64 bits. The seven-bit groups of the first eight bytes are
+ * gathered in three SWAR steps.
+ */
+__device__ __forceinline__ uint64_t varint_value(uint64_t lo, uint64_t hi, uint32_t len)
+{
+  uint64_t x = (len < word_bytes ? lo & ((uint64_t{1} << (byte_bits * len)) - 1) : lo) &
+               0x7f7f'7f7f'7f7f'7f7full;
+  x = (x & 0x007f'007f'007f'007full) | ((x & 0x7f00'7f00'7f00'7f00ull) >> 1);
+  x = (x & 0x0000'3fff'0000'3fffull) | ((x & 0x3fff'0000'3fff'0000ull) >> 2);
+  x = (x & 0x0000'0000'0fff'ffffull) | ((x & 0x0fff'ffff'0000'0000ull) >> 4);
+  if (len > word_bytes) { x |= (hi & 0x7f) << 56; }
+  if (len > word_bytes + 1) { x |= ((hi >> byte_bits) & 0x7f) << 63; }
+  return x;
+}
+
+/**
  * @brief Returns the number of bytes up to and including the lowest byte of `stop` whose top bit is
  * set.
  *
@@ -1477,14 +1494,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                              : (stop_hi != 0 ? word_bytes + stop_byte_count(stop_hi)
                                              : header_bytes + 1);
           if (len > max_varint_bytes) { break; }
-          v = 0;
-#pragma unroll
-          for (uint32_t i = 0; i < max_varint_bytes; ++i) {
-            uint64_t const byte =
-              (i < word_bytes ? window >> (byte_bits * i) : hi >> (byte_bits * (i - word_bytes))) &
-              0x7f;
-            if (i < len) { v |= byte << (7 * i); }
-          }
+          v = varint_value(window, hi, len);
           // len + mb_count <= 14, so the widths lie within the 16 bytes.
           widths = static_cast<uint32_t>(
             len < word_bytes ? (window >> (byte_bits * len)) | (hi << (word_bits - byte_bits * len))
@@ -1663,14 +1673,7 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
                       ? (window2 >> (byte_bits * len2)) | (hi2 << (word_bits - byte_bits * len2))
                       : hi2 >> (byte_bits * (len2 - word_bytes)));
                   if (widths2 != widths_w) { return; }
-                  v2 = 0;
-#pragma unroll
-                  for (uint32_t i = 0; i < max_varint_bytes; ++i) {
-                    uint64_t const byte = (i < word_bytes ? window2 >> (byte_bits * i)
-                                                          : hi2 >> (byte_bits * (i - word_bytes))) &
-                                          0x7f;
-                    if (i < len2) { v2 |= byte << (7 * i); }
-                  }
+                  v2 = varint_value(window2, hi2, len2);
                 }
                 block_q    = p + len2 + 4;
                 block_next = block_q + block_bytes;
