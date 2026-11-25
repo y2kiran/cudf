@@ -1376,8 +1376,10 @@ __device__ kernel_error::value_type decode_page(warp_tile const& warp,
     return static_cast<kernel_error::value_type>(decode_error::DELTA_PARAMS_UNSUPPORTED);
   }
   auto const mb_count      = static_cast<uint32_t>(mini_block_count);
-  auto const passes_per_mb = static_cast<uint32_t>((block_size / mini_block_count) / warp_lanes);
-  auto const block_passes  = static_cast<uint32_t>(block_size / warp_lanes);
+  // Both counts fit in 32 bits once the header is valid.
+  auto const passes_per_mb =
+    static_cast<uint32_t>(block_size) / mb_count / warp_lanes;
+  auto const block_passes = static_cast<uint32_t>(block_size) / warp_lanes;
   auto const block_values  = static_cast<uint32_t>(block_size);
   // Bytes of packed data in a mini-block per bit of width
   uint32_t const mb_bytes_per_bit = passes_per_mb * pass_bytes_per_bit;
@@ -2085,7 +2087,8 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
   PageInfo& page,
   device_span<ColumnChunkDesc const> chunks,
   size_t min_row,
-  size_t num_rows)
+  size_t num_rows,
+  uint32_t head)
 {
   __shared__ __align__(16) full_page_decode_state state_g;
   auto* const s = &state_g;
@@ -2101,6 +2104,11 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
     return 0;
   }
 
+  // `head` holds early loads of the page head and nz map; storing it keeps the loads.
+  {
+    __shared__ uint32_t head_sink[cudf::detail::warp_size];
+    head_sink[warp.thread_rank()] = head;
+  }
   bool const process_nulls = should_process_nulls(s);
   auto const* const nz_idx = page.nz_map->nz_idx;
   auto const nz_count      = page.nz_map->nz_count;
@@ -2164,7 +2172,20 @@ CUDF_KERNEL void __launch_bounds__(decode_delta_binary_with_nz_map_block_size,
   auto& page = pages[page_idx];
   // Pages with a map are decoded here; the level-decoding kernel takes the rest.
   if (not page.has_nz_map(nz_map_kind::DELTA_FLAT)) { return; }
-  auto const error = decode_mapped_page(warp, page, chunks, min_row, num_rows);
+  // Start the loads the decode needs first, the head of the page data and the nz map's count, so
+  // they arrive while the page state is set up. The values are discarded into shared memory.
+  uint32_t head = 0;
+  {
+    auto const data = reinterpret_cast<uintptr_t>(page.page_data) & ~uintptr_t{3};
+    auto const size = static_cast<uintptr_t>(cuda::std::max(page.uncompressed_page_size, 0));
+    // One word of each 32-byte sector of the first 512 bytes
+    auto const at = data + (warp.thread_rank() % 16) * 32;
+    if (at < reinterpret_cast<uintptr_t>(page.page_data) + size) {
+      head = warp.thread_rank() < 16 ? __ldg(reinterpret_cast<uint32_t const*>(at))
+                                     : static_cast<uint32_t>(__ldg(&page.nz_map->nz_count));
+    }
+  }
+  auto const error = decode_mapped_page(warp, page, chunks, min_row, num_rows, head);
   if (error != 0) {
     cg::invoke_one(warp, [&] { set_error(error, error_code); });
   }
