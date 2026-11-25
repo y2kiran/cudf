@@ -2107,7 +2107,8 @@ __device__ __forceinline__ kernel_error::value_type decode_mapped_page(
   // `head` holds early loads of the page head and nz map; storing it keeps the loads.
   {
     __shared__ uint32_t head_sink[cudf::detail::warp_size];
-    head_sink[warp.thread_rank()] = head;
+    auto const sink = static_cast<uint32_t>(__cvta_generic_to_shared(head_sink + warp.thread_rank()));
+    asm volatile("st.shared.u32 [%0], %1;" ::"r"(sink), "r"(head));
   }
   bool const process_nulls = should_process_nulls(s);
   auto const* const nz_idx = page.nz_map->nz_idx;
