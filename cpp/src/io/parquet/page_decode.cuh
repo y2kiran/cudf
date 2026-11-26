@@ -15,6 +15,7 @@
 #include <cuda/atomic>
 #include <cuda/std/algorithm.min.h>
 #include <cuda/std/tuple>
+#include <cuda/std/type_traits>
 
 namespace cudf::io::parquet::detail {
 
@@ -1095,11 +1096,27 @@ inline __device__ bool setup_local_page_info(auto* const s,
 {
   int t = threadIdx.x;
 
-  // Fetch page info
-  if (!t) {
-    s->setup.page = *p;
-    if constexpr (requires { s->nesting; }) { s->nesting.nesting_info = nullptr; }
-    s->setup.col = chunks[s->setup.page.chunk_idx];
+  // Fetch page info: the threads copy the page and chunk descriptors together, word by word.
+  {
+    static_assert(cuda::std::is_trivially_copyable_v<PageInfo> and
+                    cuda::std::is_trivially_copyable_v<ColumnChunkDesc>,
+                  "The descriptors are copied word by word");
+    static_assert(sizeof(PageInfo) % sizeof(uint32_t) == 0 and
+                    sizeof(ColumnChunkDesc) % sizeof(uint32_t) == 0,
+                  "The descriptors are copied in 4-byte words");
+    auto copy_words = [t](auto& dst, auto const& src) {
+      auto* const to         = reinterpret_cast<uint32_t*>(&dst);
+      auto const* const from = reinterpret_cast<uint32_t const*>(&src);
+      for (int i = t; i < static_cast<int>(sizeof(dst) / sizeof(uint32_t));
+           i += static_cast<int>(blockDim.x)) {
+        to[i] = from[i];
+      }
+    };
+    copy_words(s->setup.page, *p);
+    copy_words(s->setup.col, chunks[p->chunk_idx]);
+    if constexpr (requires { s->nesting; }) {
+      if (!t) { s->nesting.nesting_info = nullptr; }
+    }
   }
   __syncthreads();
 
